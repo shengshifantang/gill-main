@@ -66,6 +66,30 @@ class GILLModel(nn.Module):
     self.num_tokens = args.num_tokens
     self.num_clip_tokens = args.num_clip_tokens
 
+    # =========================================================
+    # 🚨 快速保护: 检测并强制 Kolors / ChatGLM3 维度对齐
+    # 如果用户在配置中已将 gen_emb_dim 设为较大值或 num_clip_tokens 很大，
+    # 我们认为用户意在使用 Kolors（ChatGLM3）并强制调整到 4096
+    self.is_kolors_config = False
+    try:
+      if (hasattr(self.args, 'gen_emb_dim') and self.args.gen_emb_dim is not None and self.args.gen_emb_dim >= 2048) or (hasattr(self.args, 'num_clip_tokens') and self.args.num_clip_tokens is not None and self.args.num_clip_tokens >= 256):
+        self.is_kolors_config = True
+    except Exception:
+      self.is_kolors_config = False
+
+    if self.is_kolors_config:
+      if not hasattr(self.args, 'gen_emb_dim') or self.args.gen_emb_dim != 4096:
+        try:
+          old = getattr(self.args, 'gen_emb_dim', None)
+          print(f"\n⚠️ [CRITICAL WARNING] 检测到 Kolors 配置 (gen_emb_dim={old})，强制将 gen_emb_dim 修改为 4096 以匹配 ChatGLM3 Text Encoder。\n")
+        except Exception:
+          pass
+        self.args.gen_emb_dim = 4096
+      # Kolors 通常需要较多的 clip tokens / token length
+      if not hasattr(self.args, 'num_clip_tokens') or self.args.num_clip_tokens < 256:
+        self.args.num_clip_tokens = 256
+        print("⚠️ 调整 num_clip_tokens 为 256（Kolors 兼容）。")
+
     opt_version = args.opt_version
     visual_encoder = args.visual_encoder
     n_visual_tokens = args.n_visual_tokens

@@ -140,11 +140,12 @@ class FeedbackVerifier:
         """使用 Qwen-VL 验证"""
         try:
             # 构建验证 prompt
-            verify_prompt = f"请检查这张图片是否符合以下描述：{prompt}。"
+            verify_prompt = f"请作为一名极度严格的视觉质检员。检查图片是否符合描述：{prompt}."
             if expected_layout:
-                verify_prompt += " 特别检查以下对象的位置："
+                verify_prompt += " \n必须严格检查以下物体的位置是否正确：\n"
                 for obj in expected_layout:
-                    verify_prompt += f" {obj['name']}应该在位置{obj['bbox']}；"
+                    verify_prompt += f"- {obj['name']} 应该在 {obj['bbox']} (坐标格式[x1,y1,x2,y2])\n"
+            verify_prompt += "\n如果符合，请只回答'符合'。如果不符合，请具体指出哪个物体位置错了，并给出修正建议（例如：'猫太靠左了，应该向右移动'）。"
             
             # 处理输入
             messages = [
@@ -183,26 +184,23 @@ class FeedbackVerifier:
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False
             )[0]
-            
-            # 解析响应（简单启发式）
-            is_correct = "符合" in response_text or "正确" in response_text or "是的" in response_text
-            confidence = 0.8 if is_correct else 0.3
-            
-            # 提取反馈
-            feedback = response_text.strip()
-            
-            # 生成修正建议
-            suggested_prompt = prompt
-            if not is_correct and "建议" in response_text or "应该" in response_text:
-                # 尝试从响应中提取建议
-                suggested_prompt = prompt  # 简化处理
-            
+            # 解析响应
+            response_text = response_text.strip()
+            is_correct = "符合" in response_text and "不符合" not in response_text
+            confidence = 0.9 if is_correct else 0.2
+
+            # 🌟 Refinement Logic: 如果不正确，返回 refinement_instruction 以便下一轮调整 layout
+            refinement_instruction = None
+            if not is_correct:
+                refinement_instruction = f"上一轮生成结果存在偏差：{response_text}。请根据此反馈调整布局。"
+
             return {
                 "correct": is_correct and confidence >= threshold,
                 "confidence": confidence,
-                "feedback": feedback,
-                "suggested_prompt": suggested_prompt,
-                "detected_objects": []  # Qwen-VL 需要额外调用才能获取 grounding
+                "feedback": response_text,
+                "refinement_instruction": refinement_instruction,
+                "suggested_prompt": prompt,
+                "detected_objects": []
             }
             
         except Exception as e:
