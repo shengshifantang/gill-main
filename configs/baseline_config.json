@@ -1,0 +1,34 @@
+{
+  "base_gill": {
+    "device": "cuda:0",
+    "gill_model": "./checkpoints/gill_opt",
+    "use_layout_planner": false,
+    "use_spatial_adapter": false
+  },
+  "heuristic": {
+    "device": "cuda:0",
+    "gill_model": "./checkpoints/gill_opt",
+    "use_layout_planner": false,
+    "use_spatial_adapter": true,
+    "layout_method": "heuristic"
+  },
+  "ours": {
+    "device": "cuda:0",
+    "gill_model": "./checkpoints/gill_opt",
+    "planner_model": "./checkpoints/layout_planner_cot_15k",
+    "use_layout_planner": true,
+    "use_spatial_adapter": true,
+    "layout_method": "cot_planner"
+  },
+  "gligen": {
+    "device": "cuda:0",
+    "model_path": "./checkpoints/gligen",
+    "note": "需要单独实现 GLIGEN baseline"
+  },
+  "dalle3": {
+    "openai_api_key": "your_openai_api_key_here",
+    "model": "dall-e-3",
+    "size": "1024x1024"
+  }
+}
+
