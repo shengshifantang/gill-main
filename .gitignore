@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+venv/
+.env
+.checkpoints/
+checkpoints/
+runs/
+*.pt
+*.ckpt
+.DS_Store# ignore large model/checkpoint/runtime files
+checkpoints/
+model/
+runs/
+*.pt
+*.ckpt
+__pycache__/
+*.pyc
+venv/
+.env
