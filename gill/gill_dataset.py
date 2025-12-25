@@ -102,40 +102,25 @@ def collate_fn(batch, tokenizer=None, text_encoder=None, text_projection=None, d
             # encode (we expect ChatGLMModel-like return with hidden_states)
             with torch.no_grad():
                 enc_out = text_encoder(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, output_hidden_states=True)
+
             # follow Kolors pipeline extraction: hidden_states[-2] -> token-level, hidden_states[-1][-1,:,:] -> pooled
             hidden_states = getattr(enc_out, 'hidden_states', None)
-            # Robust extraction:
-            # - token-level features are typically 3D tensors (seq, batch, dim) in Kolors' returns
-            # - pooled features may appear as a 2D tensor (batch, dim) or as a last-token slice
-            encoder_hidden_states = None
-            pooled = None
             if hidden_states is None:
+                # fallback to last_hidden_state
                 encoder_hidden_states = getattr(enc_out, 'last_hidden_state', None)
-                if encoder_hidden_states is not None and encoder_hidden_states.dim() == 3:
-                    # to (batch, seq, dim)
-                    encoder_hidden_states = encoder_hidden_states.permute(0, 1, 2).clone()
-                pooled = (encoder_hidden_states.mean(dim=1) if encoder_hidden_states is not None else None)
+                pooled = encoder_hidden_states.mean(dim=1) if encoder_hidden_states is not None else None
             else:
-                # find candidate tensors by dimensionality
-                token_cands = [h for h in hidden_states if isinstance(h, torch.Tensor) and h.dim() == 3]
-                pooled_cands = [h for h in hidden_states if isinstance(h, torch.Tensor) and h.dim() == 2]
-
-                if len(token_cands) > 0:
-                    # prefer the last 3D tensor as token-level
-                    tok = token_cands[-1]
-                    # expected tok shape: (seq, batch, dim) -> convert to (batch, seq, dim)
-                    try:
-                        encoder_hidden_states = tok.permute(1, 0, 2).clone()
-                    except Exception:
-                        encoder_hidden_states = tok.clone()
-
-                if len(pooled_cands) > 0:
-                    # prefer last 2D tensor as pooled
-                    pooled = pooled_cands[-1].clone()
-                else:
-                    # fallback: derive pooled by pooling token-level features if available
-                    if encoder_hidden_states is not None:
-                        pooled = encoder_hidden_states.mean(dim=1)
+                # hidden_states shape depends on encoder; adapt to pipeline style used in Kolors
+                # token-level
+                try:
+                    encoder_hidden_states = hidden_states[-2].permute(1, 0, 2).clone()
+                except Exception:
+                    encoder_hidden_states = hidden_states[-2]
+                # pooled (as observed in Kolors): take last hidden layer's last token-row
+                try:
+                    pooled = hidden_states[-1][-1, :, :].clone()
+                except Exception:
+                    pooled = encoder_hidden_states.mean(dim=1) if encoder_hidden_states is not None else None
 
             out.update({'input_ids': input_ids, 'encoder_hidden_states': encoder_hidden_states, 'pooled_embeds': pooled})
 
