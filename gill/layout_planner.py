@@ -8,7 +8,7 @@
 
 import torch
 import torch.nn as nn
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import re
 import json
 
@@ -42,15 +42,47 @@ def parse_layout_output(text: str) -> List[Dict]:
     return objects
 
 
-def format_layout_input(prompt: str) -> str:
+def format_layout_input(prompt: str, enable_cot: bool = False, feedback: Optional[str] = None) -> str:
     """
     格式化输入 prompt 为 Instruction Tuning 格式
     
     示例：
     输入："画一只在桌子左边的猫"
     输出："用户：画一只在桌子左边的猫\n助手：<obj>猫</obj><box>[0.0,0.3,0.4,0.7]</box>"
+    
+    Args:
+        prompt: 原始提示词
+        enable_cot: 是否启用 Chain-of-Thought（思考过程）
+        feedback: 上一轮的反馈（用于修正）
     """
-    return f"用户：{prompt}\n助手："
+    if enable_cot:
+        # 🌟 Chain-of-Thought 版本：让模型先"思考"再输出布局
+        cot_prompt = f"""用户：{prompt}
+
+请按以下步骤思考并规划布局：
+1. 首先，分析提示词中的空间关系（如"左边"、"上方"等）
+2. 然后，确定每个物体的相对位置
+3. 最后，输出布局坐标
+
+助手："""
+        if feedback:
+            cot_prompt = f"""用户：{prompt}
+
+上一轮反馈：{feedback}
+
+请根据反馈重新规划布局：
+1. 分析上一轮的问题
+2. 调整空间关系
+3. 输出修正后的布局坐标
+
+助手："""
+        return cot_prompt
+    else:
+        # 标准版本
+        base_prompt = f"用户：{prompt}\n助手："
+        if feedback:
+            base_prompt = f"用户：{prompt}\n上一轮反馈：{feedback}\n请根据反馈调整布局。\n助手："
+        return base_prompt
 
 
 class LayoutPlanner(nn.Module):
@@ -210,7 +242,8 @@ class LayoutPlanner(nn.Module):
     
     def generate_layout(self, prompt: str, max_length: int = 128,
                        temperature: float = 0.2, top_p: float = 1.0,
-                       apply_refinement: bool = True) -> Dict:
+                       apply_refinement: bool = True, enable_cot: bool = False,
+                       feedback: Optional[str] = None) -> Dict:
         """
         生成布局规划
         
@@ -219,6 +252,9 @@ class LayoutPlanner(nn.Module):
             max_length: 最大生成长度
             temperature: 采样温度
             top_p: nucleus sampling 参数
+            apply_refinement: 是否应用启发式修正
+            enable_cot: 是否启用 Chain-of-Thought（思考过程）
+            feedback: 上一轮的反馈（用于修正）
         
         Returns:
             {
@@ -228,8 +264,8 @@ class LayoutPlanner(nn.Module):
         """
         self.model.eval()
         
-        # 格式化输入
-        formatted_input = format_layout_input(prompt)
+        # 格式化输入（支持 CoT 和反馈）
+        formatted_input = format_layout_input(prompt, enable_cot=enable_cot, feedback=feedback)
         
         # Tokenize
         inputs = self.tokenizer(

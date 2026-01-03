@@ -129,9 +129,35 @@ def main(args):
     # 1. 准备目录
     os.makedirs(args.save_dir, exist_ok=True)
     
-    # 2. 读取 CSV 文件列表
-    csv_files = sorted([str(p) for p in Path(args.csv_dir).rglob("*.csv")])
-    print(f"📦 Found {len(csv_files)} CSV files in {args.csv_dir}")
+    # 2. 读取已有进度（断点续传支持）
+    processed_urls = set()
+    if os.path.exists(args.output_jsonl):
+        print(f"📖 Reading existing progress from {args.output_jsonl}...")
+        try:
+            with open(args.output_jsonl, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line.strip())
+                        if 'url' in data:
+                            processed_urls.add(data['url'])
+                    except:
+                        pass
+            print(f"✅ Found {len(processed_urls)} already downloaded images.")
+            TOTAL_DOWNLOADED = len(processed_urls)  # 更新计数器
+        except Exception as e:
+            print(f"⚠️ Warning: Could not read existing progress: {e}")
+            processed_urls = set()
+    
+    # 3. 读取 CSV 文件列表
+    # 支持两种方式：
+    # - 如果 csv_dir 是文件，直接使用
+    # - 如果 csv_dir 是目录，递归查找所有 CSV 文件
+    if os.path.isfile(args.csv_dir):
+        csv_files = [args.csv_dir]
+        print(f"📦 Using single CSV file: {os.path.basename(args.csv_dir)}")
+    else:
+        csv_files = sorted([str(p) for p in Path(args.csv_dir).rglob("*.csv")])
+        print(f"📦 Found {len(csv_files)} CSV files in {args.csv_dir}")
     
     if args.limit_csvs:
         csv_files = csv_files[:args.limit_csvs]
@@ -139,7 +165,24 @@ def main(args):
     # 创建线程池 (复用，不要反复创建销毁)
     executor = ThreadPoolExecutor(max_workers=args.workers)
 
-    with open(args.output_jsonl, 'w', encoding='utf-8') as f_out:
+    # --- 安全补丁：确保文件以换行符结尾（防止异常中断导致格式错误）---
+    if os.path.exists(args.output_jsonl):
+        try:
+            with open(args.output_jsonl, 'rb+') as f:
+                f.seek(0, 2)  # 移动到文件末尾
+                if f.tell() > 0:  # 如果文件不为空
+                    f.seek(-1, 2)  # 移动到倒数第一个字节
+                    last_char = f.read(1)
+                    if last_char != b'\n':
+                        print("🔧 检测到上次运行未正常换行，正在自动修复...")
+                        f.write(b'\n')
+        except Exception as e:
+            print(f"⚠️ 文件修复检查失败 (不影响运行): {e}")
+    # ------------------------------------------------------------------------
+
+    # 使用追加模式，避免清空已有数据
+    file_mode = 'a' if os.path.exists(args.output_jsonl) else 'w'
+    with open(args.output_jsonl, file_mode, encoding='utf-8') as f_out:
         for csv_file in csv_files:
             print(f"\n🚀 Processing {os.path.basename(csv_file)} in chunks...")
             
@@ -151,6 +194,19 @@ def main(args):
                 chunk_idx = 0
                 for chunk in chunk_iter:
                     chunk_idx += 1
+                    
+                    # 过滤掉已经处理过的 URL（提升重启后的速度）
+                    if 'url' in chunk.columns:
+                        original_size = len(chunk)
+                        chunk = chunk[~chunk['url'].isin(processed_urls)]
+                        filtered_count = original_size - len(chunk)
+                        if filtered_count > 0:
+                            print(f"  ⏭️  Skipped {filtered_count} already processed URLs in chunk {chunk_idx}")
+                    
+                    # 如果 chunk 为空，跳过
+                    if chunk.empty:
+                        continue
+                    
                     stop = process_chunk(chunk, args, executor, f_out, chunk_idx)
                     if stop:
                         print(f"\n🛑 Reached max samples: {args.max_samples}")
@@ -168,7 +224,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv_dir", type=str, required=True, help="Path to wukong_release folder")
+    parser.add_argument("--csv_dir", type=str, required=True, 
+                       help="Path to CSV file or directory containing CSV files")
     parser.add_argument("--save_dir", type=str, required=True, help="Directory to save images")
     parser.add_argument("--output_jsonl", type=str, required=True, help="Output path for wukong_raw.jsonl")
     parser.add_argument("--workers", type=int, default=64, help="Number of download threads")

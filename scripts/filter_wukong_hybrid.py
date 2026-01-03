@@ -635,11 +635,11 @@ def main(args):
                     csv_skipped_chunks += 1
                     continue
                 
-                # 优化：如果已跳过条数超过50，跳过整个chunk（避免处理大部分已处理的chunk）
-                if len(already_processed) > 50:
+                # 优化：如果已跳过条数超过40，跳过整个chunk（避免处理大部分已处理的chunk）
+                if len(already_processed) > 40:
                     csv_processed_count += len(chunk_urls)
                     csv_skipped_chunks += 1
-                    print(f"  ⏭️  跳过整个chunk：已跳过 {len(already_processed)} 条（超过50条阈值）")
+                    print(f"  ⏭️  跳过整个chunk：已跳过 {len(already_processed)} 条（超过40条阈值）")
                     continue
                 
                 # 第一步：关键词快速预筛选
