@@ -32,7 +32,7 @@ python scripts/annotate_async_vllm.py \
     --output /mnt/disk/lxh/gill_data/wukong_labeled_vllm.jsonl \
     --api-base http://localhost:8000/v1 \
     --model-name /root/models/Qwen2.5-VL-32B-Instruct-AWQ \
-    --max-concurrency 64
+    --max-concurrency 32
 """
 
 import os
@@ -60,7 +60,7 @@ except ImportError:
 
 
 # ================= 配置区域 =================
-DEFAULT_MAX_CONCURRENCY = 64  # 建议根据显存负载调整：3x4090 TP=3 可以尝试 50-100
+DEFAULT_MAX_CONCURRENCY = 32  # 建议根据显存负载调整：2x4090 TP=2 建议 32-50（降低并发数可减少超时错误）
 DEFAULT_API_BASE = "http://localhost:8000/v1"
 DEFAULT_API_KEY = "EMPTY"  # vLLM 不需要真实的 API Key
 # ===========================================
@@ -109,18 +109,26 @@ def sanitize_bbox(bbox: list, width: int = 1000, height: int = 1000) -> Optional
     [关键] 坐标清洗与验证
     
     1. 确保坐标是数字
-    2. 确保 x1 < x2, y1 < y2
-    3. 裁剪到 [0, 1000] 范围
-    4. 过滤无效框（面积过小或反向框）
+    2. 自动检测 0-1 范围的归一化坐标并转换为 0-1000
+    3. 确保 x1 < x2, y1 < y2
+    4. 裁剪到 [0, 1000] 范围
+    5. 过滤无效框（面积过小或反向框）
     
     这对于训练稳定性至关重要，防止 NaN/Inf 导致 Loss 异常。
     """
     try:
-        # 强制转 float 再转 int（处理字符串数字）
-        b = [int(float(x)) for x in bbox]
+        # 强制转 float（处理字符串数字）
+        b = [float(x) for x in bbox]
         if len(b) != 4:
             return None
         
+        # [优化] 自动检测 0-1 范围的归一化坐标
+        # 如果所有坐标都在 0.0-1.0 之间，则自动乘以 1000
+        if all(0.0 <= x <= 1.0 for x in b):
+            b = [x * 1000 for x in b]
+        
+        # 转换为整数
+        b = [int(x) for x in b]
         x1, y1, x2, y2 = b[0], b[1], b[2], b[3]
         
         # 确保顺序正确（左上角 < 右下角）
@@ -225,10 +233,7 @@ class AnnotationWorker:
             api_key=args.api_key or DEFAULT_API_KEY,
             base_url=args.api_base or DEFAULT_API_BASE
         )
-        self.processed_paths = self._load_progress()
-        self.semaphore = asyncio.Semaphore(args.max_concurrency)
-        self.write_lock = asyncio.Lock()  # 文件写入锁
-        self.error_log_path = args.output.replace(".jsonl", "_errors.jsonl")  # 错误日志
+        # 先初始化 stats，因为 _load_progress 会使用它
         self.stats = {
             'total': 0,
             'processed': 0,
@@ -238,9 +243,15 @@ class AnnotationWorker:
             'parse_error': 0,  # JSON 解析失败
             'invalid_bbox': 0  # 坐标无效
         }
+        self.processed_paths = self._load_progress()
+        self.max_concurrency = args.max_concurrency
+        # 注意：semaphore 和 lock 在 run() 方法中创建，确保在正确的事件循环中
+        self.semaphore = None
+        self.write_lock = None
+        self.error_log_path = args.output.replace(".jsonl", "_errors.jsonl")  # 错误日志
 
     def _load_progress(self) -> Set[str]:
-        """加载已处理的图片路径"""
+        """加载已处理的图片路径（标准化路径以确保一致性）"""
         processed = set()
         if os.path.exists(self.args.output):
             print(f"📖 读取断点续传文件: {self.args.output}")
@@ -252,7 +263,13 @@ class AnnotationWorker:
                         data = json.loads(line.strip())
                         image_path = data.get('image_path')
                         if image_path:
-                            processed.add(image_path)
+                            # 标准化路径（与 process_single_item 保持一致）
+                            if not os.path.isabs(image_path):
+                                full_path = os.path.join(self.args.image_root, image_path)
+                            else:
+                                full_path = image_path
+                            normalized_path = os.path.normpath(full_path)
+                            processed.add(normalized_path)
                     except:
                         pass
         print(f"✅ 已完成: {len(processed)} 条")
@@ -295,8 +312,10 @@ class AnnotationWorker:
                 b64_img = await asyncio.to_thread(encode_image_base64, image_path)
                 prompt = build_prompt(item.get('caption', ''))
 
-                # 发送请求到 vLLM
-                response = await self.client.chat.completions.create(
+                # [优化] 添加超时控制（120秒），防止请求卡死
+                try:
+                    response = await asyncio.wait_for(
+                        self.client.chat.completions.create(
                     model=self.args.model_name,
                     messages=[
                         {
@@ -316,7 +335,11 @@ class AnnotationWorker:
                     max_tokens=512,
                     temperature=0.1,  # 低温度保证格式稳定
                     top_p=0.9,
+                        ),
+                        timeout=120.0  # 120秒超时（从60秒增加到120秒，减少超时错误）
                 )
+                except asyncio.TimeoutError:
+                    raise Exception("Request timeout after 120 seconds")
 
                 content = response.choices[0].message.content
 
@@ -370,19 +393,17 @@ class AnnotationWorker:
                             f_err.write(json.dumps(error_entry, ensure_ascii=False) + "\n")
                     except Exception:
                         pass  # 错误日志写入失败不影响主流程
-
-            except Exception as e:
-                # 错误处理：记录失败但不中断流程
-                self.stats['failed'] += 1
-                # 可选：记录错误详情到日志
-                # print(f"⚠️ Error processing {image_path}: {e}")
             finally:
                 self.stats['processed'] += 1
                 pbar.update(1)
 
     async def run(self):
         """主运行函数"""
-        # 1. 读取输入数据
+        # 在事件循环中创建 Semaphore 和 Lock（修复事件循环问题）
+        self.semaphore = asyncio.Semaphore(self.max_concurrency)
+        self.write_lock = asyncio.Lock()
+        
+        # 1. 读取输入数据（跳过已处理的，使用标准化路径）
         tasks_data = []
         print(f"📖 读取输入文件: {self.args.input}")
         with open(self.args.input, 'r', encoding='utf-8') as f:
@@ -390,8 +411,15 @@ class AnnotationWorker:
                 try:
                     item = json.loads(line.strip())
                     image_path = item.get('image_path', '')
-                    if image_path and image_path not in self.processed_paths:
-                        tasks_data.append(item)
+                    if image_path:
+                        # 标准化路径（与 _load_progress 保持一致）
+                        if not os.path.isabs(image_path):
+                            full_path = os.path.join(self.args.image_root, image_path)
+                        else:
+                            full_path = image_path
+                        normalized_path = os.path.normpath(full_path)
+                        if normalized_path not in self.processed_paths:
+                            tasks_data.append(item)
                 except json.JSONDecodeError:
                     continue
 
@@ -479,7 +507,7 @@ def main():
        --output wukong_labeled.jsonl \\
        --api-base http://localhost:8000/v1 \\
        --model-name /root/models/Qwen2.5-VL-32B-Instruct-AWQ \\
-       --max-concurrency 64
+       --max-concurrency 32
         """
     )
     parser.add_argument(

@@ -39,7 +39,8 @@ class InferenceAgent:
         gill_model_path: Optional[str] = None,
         layout_planner_path: Optional[str] = None,
         spatial_adapter_path: Optional[str] = None,
-        verifier_model_path: str = "/home/lxh/Project/gill-main/model/Qwen2-VL-7B-Instruct",
+        verifier_model_path: str = "/mnt/disk/lxh/models/Qwen2.5-VL-7B-Instruct",
+        verifier_type: str = "hybrid",  # 添加 verifier_type 参数
         device: str = "cuda",
         max_retries: int = 3,
         enable_cot: bool = True  # Chain-of-Thought
@@ -57,6 +58,7 @@ class InferenceAgent:
         self.device = device
         self.max_retries = max_retries
         self.enable_cot = enable_cot
+        self.verifier_type = verifier_type  # 保存 verifier_type
         
         print("🚀 初始化推理代理...")
         
@@ -428,8 +430,8 @@ def main():
     parser.add_argument(
         "--verifier_model_path",
         type=str,
-        default="/home/lxh/Project/gill-main/model/Qwen2-VL-7B-Instruct",
-        help="验证器模型路径（Qwen2-VL）"
+        default="/mnt/disk/lxh/models/Qwen2.5-VL-7B-Instruct",
+        help="验证器模型路径（Qwen2.5-VL-7B-Instruct）"
     )
     parser.add_argument(
         "--output_dir",

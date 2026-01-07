@@ -451,8 +451,24 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--image-dir", type=str, default=None)
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="指定 GPU 设备 (例如: cuda:0, cuda:1, cuda:2)。默认自动选择第一个可用 GPU"
+    )
     
     args = parser.parse_args()
+    
+    # 确定设备
+    if args.device:
+        device = args.device
+    elif torch.cuda.is_available():
+        device = "cuda:0"  # 默认使用第一个 GPU
+    else:
+        device = "cpu"
+    
+    print(f"🔧 使用设备: {device}")
     
     train_spatial_adapter(
         args.mixed_data,
@@ -461,6 +477,6 @@ if __name__ == "__main__":
         args.batch_size,
         args.epochs,
         args.lr,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=device,
         image_dir=args.image_dir
     )

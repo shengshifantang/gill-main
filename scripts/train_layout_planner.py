@@ -84,10 +84,10 @@ class LayoutJsonlDataset(Dataset):
                         bbox_str = ",".join(f"{int(v)}" for v in bbox_1000)
                     elif bbox and len(bbox) == 4:
                         # 使用 0-1 浮点数格式
-                    try:
-                        bbox_f = [float(v) for v in bbox]
+                        try:
+                            bbox_f = [float(v) for v in bbox]
                             bbox_str = ",".join(f"{v:.2f}" for v in bbox_f)
-                    except Exception:
+                        except Exception:
                             continue
                     else:
                         continue

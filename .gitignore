@@ -17,3 +17,6 @@ __pycache__/
 *.pyc
 venv/
 .env
+.cursor/
+data/mixed_train_20pct.jsonl
+data/layout_planner_train.jsonl
