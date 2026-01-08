@@ -528,7 +528,7 @@ class FeedbackVerifier:
             model_path = vlm_model_name or "Qwen/Qwen2-VL-7B-Instruct"
             self.semantic_expert = QwenSemanticVerifier(model_path, device)
             self.verifier = self.semantic_expert
-        else:
+            else:
             raise ValueError(f"未知的验证器类型: {verifier_type}")
     
     def verify(self, 
@@ -553,12 +553,12 @@ class FeedbackVerifier:
         elif isinstance(self.verifier, GroundingDinoVerifier):
             if expected_layout:
                 result = self.verifier.verify_layout(image, expected_layout)
-                return {
+            return {
                     "correct": result["correct"],
                     "confidence": result["score"],
                     "feedback": result["feedback"],
                     "refinement_instruction": result["feedback"] if not result["correct"] else None,
-                    "suggested_prompt": original_prompt,
+                "suggested_prompt": original_prompt,
                     "detected_objects": result.get("details", [])
                 }
             else:
@@ -587,7 +587,7 @@ class FeedbackVerifier:
                 "suggested_prompt": original_prompt,
                 "detected_objects": []
             }
-
+    
 
 def create_feedback_verifier(vlm_model_name: str = "Qwen/Qwen2-VL-7B-Instruct",
                              verifier_type: Literal["grounding_dino", "qwen2vl_7b", "hybrid", "qwen2vl"] = "hybrid",

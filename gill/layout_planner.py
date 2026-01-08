@@ -1,14 +1,13 @@
 """
-布局规划器 (Layout Planner)
+布局规划器 (Layout Planner) - Refactored
 
-基于 DeepSeek-7B，使用 LoRA 微调，使其能够输出结构化布局信息。
-
-输出格式：<obj>对象名</obj><box>[x1,y1,x2,y2]</box>
+基于 DeepSeek/Qwen，使用 LoRA 微调，通过 Instruction Tuning 输出结构化布局。
+与训练脚本对齐，统一使用 Chat Template。
 """
 
 import torch
 import torch.nn as nn
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 import re
 import json
 
@@ -16,22 +15,60 @@ import json
 def parse_layout_output(text: str) -> List[Dict]:
     """
     解析布局输出文本，提取对象和坐标
+    输入格式：<obj>对象名</obj><box>[x1,y1,x2,y2]</box>
     
-    输入格式：<obj>对象名</obj><box>[x1,y1,x2,y2]</box>...
-    
-    返回：[{"name": "对象名", "bbox": [x1, y1, x2, y2]}]
+    支持两种解析模式：
+    1. 标准格式：<obj>...</obj><box>[...]</box>
+    2. 后备格式：从乱码中提取坐标 [x1,y1,x2,y2] 和对象名
     """
     objects = []
     
-    # 匹配 <obj>...</obj><box>...</box> 模式
+    # 模式1：标准格式解析
     pattern = r'<obj>([^<]+)</obj><box>\[([^\]]+)\]</box>'
     matches = re.findall(pattern, text)
     
-    for name, bbox_str in matches:
+    if matches:  # 如果标准格式解析成功，直接返回
+        for name, bbox_str in matches:
+            try:
+                bbox = [float(x.strip()) for x in bbox_str.split(',')]
+                if len(bbox) == 4:
+                    # 简单的坐标范围检查/归一化（如果是 0-1000 格式）
+                    if max(bbox) > 1.5:
+                        bbox = [b / 1000.0 for b in bbox]
+                    
+                    objects.append({
+                        "name": name.strip(),
+                        "bbox": bbox
+                    })
+            except:
+                continue
+        return objects
+    
+    # 模式2：后备解析（从乱码中提取坐标和对象名）
+    # 提取所有坐标格式：[...]
+    bbox_pattern = r'\[([0-9.,\s]+)\]'
+    bbox_matches = re.findall(bbox_pattern, text)
+    
+    # 提取可能的对象名（中文词汇，长度 1-6）
+    # 清理特殊 token 和乱码字符
+    cleaned_text = re.sub(r'</?tool_call>', '', text)
+    cleaned_text = re.sub(r'<\|[^|]+\|>', '', cleaned_text)
+    cleaned_text = re.sub(r'[a-zA-Z]{3,}', '', cleaned_text)  # 移除长英文单词（如 useRal）
+    
+    # 提取中文词汇作为对象名
+    chinese_words = re.findall(r'[\u4e00-\u9fff]+', cleaned_text)
+    
+    for i, bbox_str in enumerate(bbox_matches):
         try:
-            # 解析坐标
             bbox = [float(x.strip()) for x in bbox_str.split(',')]
             if len(bbox) == 4:
+                # 归一化
+                if max(bbox) > 1.5:
+                    bbox = [b / 1000.0 for b in bbox]
+                
+                # 获取对象名（优先使用对应位置的中文词，否则使用"物体"）
+                name = chinese_words[i] if i < len(chinese_words) else "物体"
+                
                 objects.append({
                     "name": name.strip(),
                     "bbox": bbox
@@ -42,206 +79,93 @@ def parse_layout_output(text: str) -> List[Dict]:
     return objects
 
 
-def format_layout_input(prompt: str, enable_cot: bool = False, feedback: Optional[str] = None) -> str:
+def format_layout_input(tokenizer, prompt: str, enable_cot: bool = False, feedback: Optional[str] = None) -> str:
     """
-    格式化输入 prompt 为 Instruction Tuning 格式
-    
-    示例：
-    输入："画一只在桌子左边的猫"
-    输出："用户：画一只在桌子左边的猫\n助手：<obj>猫</obj><box>[0.0,0.3,0.4,0.7]</box>"
-    
-    Args:
-        prompt: 原始提示词
-        enable_cot: 是否启用 Chain-of-Thought（思考过程）
-        feedback: 上一轮的反馈（用于修正）
+    使用 Tokenizer 的 Chat Template 格式化输入
     """
-    if enable_cot:
-        # 🌟 Chain-of-Thought 版本：让模型先"思考"再输出布局
-        cot_prompt = f"""用户：{prompt}
+    if feedback:
+        user_content = f"{prompt}\n\n上一轮反馈：{feedback}\n请根据反馈调整布局。"
+    elif enable_cot:
+        user_content = f"""{prompt}
 
 请按以下步骤思考并规划布局：
 1. 首先，分析提示词中的空间关系（如"左边"、"上方"等）
 2. 然后，确定每个物体的相对位置
-3. 最后，输出布局坐标
-
-助手："""
-        if feedback:
-            cot_prompt = f"""用户：{prompt}
-
-上一轮反馈：{feedback}
-
-请根据反馈重新规划布局：
-1. 分析上一轮的问题
-2. 调整空间关系
-3. 输出修正后的布局坐标
-
-助手："""
-        return cot_prompt
+3. 最后，输出布局坐标"""
     else:
-        # 标准版本
-        base_prompt = f"用户：{prompt}\n助手："
-        if feedback:
-            base_prompt = f"用户：{prompt}\n上一轮反馈：{feedback}\n请根据反馈调整布局。\n助手："
-        return base_prompt
+        user_content = prompt
+
+    messages = [{"role": "user", "content": user_content}]
+    
+    # 使用 apply_chat_template，并添加 generation prompt
+    formatted_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    return formatted_text
 
 
 class LayoutPlanner(nn.Module):
-    """
-    布局规划器
-    
-    基于预训练的 LLM（如 DeepSeek-7B），通过 LoRA 微调
-    学习将自然语言描述转换为结构化布局信息。
-    """
-    
     def __init__(self, base_model_path: str, device: str = 'cuda', use_lora: bool = True):
-        """
-        Args:
-            base_model_path: 基础模型路径（如 DeepSeek-7B）
-            device: 设备
-            use_lora: 是否使用 LoRA 微调（推荐，节省显存）
-        """
         super().__init__()
         from transformers import AutoModelForCausalLM, AutoTokenizer
         
-        # 规范化 device 参数，便于后续统一处理
-        # - "cuda" 视为 "cuda:0"
-        # - "cuda:0,1" 表示使用 0、1 两张卡做 tensor parallel
-        if isinstance(device, str):
-            if device == "cuda":
-                norm_device = "cuda:0"
-            else:
-                norm_device = device
-        else:
-            norm_device = device
-        self.device = norm_device
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        # 处理 device 参数
+        self.device = device if isinstance(device, str) else "cuda"
+        if self.device == "cuda": 
+            self.device = "cuda:0"
+
+        print(f"📦 加载 Tokenizer: {base_model_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
+        
+        # 添加布局相关的特殊 token
+        special_tokens = {"additional_special_tokens": ["<obj>", "</obj>", "<box>", "</box>"]}
+        num_added = self.tokenizer.add_special_tokens(special_tokens)
+        if num_added > 0:
+            print(f"✓ 添加了 {num_added} 个布局特殊 token")
+
+        # 加载模型
+        print(f"📦 加载基础模型: {base_model_path}")
+        # 简单处理 device_map
+        device_map = "auto" if self.device == "auto" else self.device
+        
+        self.model = AutoModelForCausalLM.from_pretrained(
             base_model_path,
+            torch_dtype=torch.bfloat16,
+            device_map=device_map,
             trust_remote_code=True
         )
         
-        # 添加布局相关的特殊 token
-        special_tokens = {
-            "additional_special_tokens": ["<obj>", "</obj>", "<box>", "</box>"]
-        }
-        num_added = self.tokenizer.add_special_tokens(special_tokens)
-        print(f"✓ 添加了 {num_added} 个布局特殊 token")
-        
-        # 加载基础模型
-        print(f"📦 加载基础模型: {base_model_path}")
-        # 多卡设置：
-        # - 如果 device 形如 "cuda:0,1"，使用 Hugging Face 的 tensor parallel，
-        #   限制权重只切到 0、1 两张卡上，并禁止 offload 到 CPU（避免吃满内存）
-        # - 否则：
-        #   - device == "auto" 时由 HF 自己决定（可能用到多卡+CPU）
-        #   - 其他情况认为是单设备，如 "cuda:0"
-        if isinstance(norm_device, str) and norm_device.startswith("cuda") and "," in norm_device:
-            # 解析 GPU id 列表，例如 "cuda:0,1"
-            gpu_ids = []
-            for part in norm_device.split(","):
-                part = part.strip()
-                if ":" in part:
-                    idx = int(part.split(":")[1])
-                else:
-                    idx = int(part)
-                gpu_ids.append(idx)
-
-            # accelerate 要求 max_memory 的 key 为整数 GPU id 或 'cpu' / 'disk'
-            max_memory = {i: "22GiB" for i in gpu_ids}
-            # 禁止 offload 到 CPU，尽量只用显存（如果想允许少量 offload，可以改成比如 '8GiB'）
-            max_memory["cpu"] = "0GiB"
-
-            print(f"✓ 使用多卡 tensor parallel: GPUs={gpu_ids}, max_memory={max_memory}")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                base_model_path,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                max_memory=max_memory,
-                trust_remote_code=True,
-            )
-            # tokenizer / 输入统一走主卡
-            self.device = f"cuda:{gpu_ids[0]}"
-        else:
-            if norm_device == "auto":
-                device_map_arg = "auto"
-            else:
-                # 单 GPU：显式绑定到指定卡，避免自动 offload 到 CPU
-                device_map_arg = norm_device
-            print(f"✓ 使用 device_map={device_map_arg}")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                base_model_path,
-                torch_dtype=torch.bfloat16,
-                device_map=device_map_arg,
-                trust_remote_code=True
-            )
-        
-        # 调整 embedding 大小
         if num_added > 0:
             self.model.resize_token_embeddings(len(self.tokenizer))
-        
-        # 全参数微调时启用 gradient checkpointing 以节省显存
-        if not use_lora and hasattr(self.model, 'gradient_checkpointing_enable'):
-            self.model.gradient_checkpointing_enable()
-            print("✓ 启用 gradient checkpointing（节省显存）")
-        
-        # 使用 LoRA 微调（推荐）
+            
+        self.use_lora = use_lora
         if use_lora:
             try:
                 from peft import LoraConfig, get_peft_model
-                
                 peft_config = LoraConfig(
                     r=16,
                     lora_alpha=32,
-                    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # 根据模型结构调整
+                    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
                     lora_dropout=0.05,
                     bias="none",
                     task_type="CAUSAL_LM"
                 )
                 self.model = get_peft_model(self.model, peft_config)
-                print("✓ 使用 LoRA 微调（参数量大幅减少）")
+                print("✓ 使用 LoRA 微调")
             except ImportError:
-                print("⚠️ peft 未安装，使用全量微调（需要更多显存）")
-                use_lora = False
-        
-        self.use_lora = use_lora
-        
-        # #region agent log
-        import json as _json, time as _time
-        if torch.cuda.is_available():
-            try:
-                log_device = torch.device(device) if device != "auto" else torch.device("cuda:0")
-            except Exception:
-                log_device = torch.device("cuda:0")
-            mem_allocated = torch.cuda.memory_allocated(log_device) / 1024**3
-            mem_reserved = torch.cuda.memory_reserved(log_device) / 1024**3
-            with open("/home/lxh/Project/gill-main/.cursor/debug.log", "a") as _f:
-                _f.write(
-                    _json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "oom_debug",
-                            "hypothesisId": "H1",
-                            "location": "layout_planner.py:__init__",
-                            "message": "model_loaded_memory",
-                            "data": {
-                                "use_lora": use_lora,
-                                "mem_allocated_gb": round(mem_allocated, 2),
-                                "mem_reserved_gb": round(mem_reserved, 2),
-                            },
-                            "timestamp": int(_time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        # #endregion
+                print("⚠️ peft 未安装，使用全量微调")
+                self.use_lora = False
         
         self.model.eval()
-    
+
     def forward(self, input_ids, labels=None, **kwargs):
         """Forward pass for training"""
         return self.model(input_ids=input_ids, labels=labels, **kwargs)
-    
-    def generate_layout(self, prompt: str, max_length: int = 128,
-                       temperature: float = 0.2, top_p: float = 1.0,
+
+    def generate_layout(self, prompt: str, max_length: int = 512,
+                       temperature: float = 0.2, top_p: float = 0.9,
                        apply_refinement: bool = True, enable_cot: bool = False,
                        feedback: Optional[str] = None) -> Dict:
         """
@@ -264,58 +188,44 @@ class LayoutPlanner(nn.Module):
         """
         self.model.eval()
         
-        # 格式化输入（支持 CoT 和反馈）
-        formatted_input = format_layout_input(prompt, enable_cot=enable_cot, feedback=feedback)
+        # 1. 格式化输入 (使用 Chat Template)
+        formatted_input = format_layout_input(
+            self.tokenizer, prompt, enable_cot=enable_cot, feedback=feedback
+        )
         
-        # Tokenize
+        # 2. Tokenize
         inputs = self.tokenizer(
-            formatted_input,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512
-        ).to(self.device)
+            formatted_input, return_tensors="pt"
+        ).to(self.model.device)
         
-        # 生成：推理阶段使用低温度 + greedy，减少随机性和重复
-        # 使用 max_new_tokens 而不是 max_length，避免输入长度超过 max_length 的问题
-        input_length = inputs['input_ids'].shape[1]
-        max_new_tokens = max(max_length - input_length, 1)  # 确保至少生成 1 个 token
-        
+        # 3. 生成
         with torch.no_grad():
             generated_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=256,
                 temperature=temperature,
                 top_p=top_p,
-                do_sample=False,
+                do_sample=True,  # 建议开启采样以避免死循环
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
         
-        # 解码
-        generated_text = self.tokenizer.decode(
-            generated_ids[0][inputs['input_ids'].shape[1]:],
-            skip_special_tokens=False
-        )
+        # 4. 解码 (只保留新生成的部分)
+        input_len = inputs.input_ids.shape[1]
+        generated_part = generated_ids[0][input_len:]
+        layout_text = self.tokenizer.decode(generated_part, skip_special_tokens=False)
         
-        # 提取布局部分（从 "助手：" 之后）
-        if "助手：" in generated_text:
-            layout_text = generated_text.split("助手：")[-1].strip()
-        else:
-            layout_text = generated_text.strip()
-
-        # 清理可能残留的 BOS token（如 DeepSeek 的 <｜begin▁of▁sentence｜>）
-        bos = getattr(self.tokenizer, "bos_token", None)
-        if isinstance(bos, str) and bos in layout_text:
-            layout_text = layout_text.replace(bos, "").strip()
-        
-        # 解析对象和坐标
+        # 5. 清理 (Qwen/DeepSeek 特殊 token)
+        layout_text = layout_text.strip()
+        for token in ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]:
+            layout_text = layout_text.replace(token, "").strip()
+            
+        # 6. 解析
         objects = parse_layout_output(layout_text)
-
-        # 根据中文位置词对 bbox 做一次启发式“吸附修正”，增强左/右/上/下等方向一致性
+        
         if apply_refinement:
             objects = refine_layout_with_caption(prompt, objects)
-        
+            
         return {
             "layout_text": layout_text,
             "objects": objects
@@ -343,7 +253,7 @@ def create_layout_planner_from_gill(gill_model, tokenizer, use_lora: bool = True
         model_path = base_lm.config._name_or_path
     else:
         # 默认路径
-        model_path = "./model/deepseek-llm-7b-base"
+        model_path = "./model/Qwen2.5-7B-Instruct"
     
     planner = LayoutPlanner(model_path, device=base_lm.device, use_lora=use_lora)
     
@@ -459,160 +369,3 @@ def refine_layout_with_caption(caption: str, objects: List[Dict]) -> List[Dict]:
         add_obj(second_name, second_slot)
 
     return new_objects
-
-
-def train_layout_planner(planner: LayoutPlanner, train_loader, 
-                        optimizer, num_epochs: int = 3, device: str = 'cuda'):
-    """
-    训练布局规划器（Instruction Tuning）
-    
-    训练数据格式：
-    {
-        "input": "画一只在桌子左边的猫",
-        "output": "<obj>猫</obj><box>[0.0,0.3,0.4,0.7]</box>"
-    }
-    """
-    planner.model.train()
-    
-    for epoch in range(num_epochs):
-        total_loss = 0.0
-        num_batches = 0
-        
-        for batch in train_loader:
-            # 格式化输入输出
-            inputs = [format_layout_input(item["input"]) for item in batch]
-            targets = [item["output"] for item in batch]
-            
-            # Tokenize
-            # 对于多 GPU（device_map="auto"），需要确定输入应该放在哪个设备
-            # 通常放在第一个 GPU 或模型的第一个设备
-            if device == "auto":
-                # 多 GPU 模式：找到第一个设备
-                if hasattr(planner.model, 'hf_device_map') and planner.model.hf_device_map:
-                    # hf_device_map 的格式可能是 {"layer_name": device_index} 或 {"layer_name": "cuda:0"}
-                    first_device_value = list(planner.model.hf_device_map.values())[0]
-                    if isinstance(first_device_value, torch.device):
-                        input_device = first_device_value
-                    elif isinstance(first_device_value, str):
-                        input_device = torch.device(first_device_value)
-                    elif isinstance(first_device_value, int):
-                        # 设备索引，如 0, 1
-                        input_device = torch.device(f"cuda:{first_device_value}")
-                    else:
-                        input_device = torch.device("cuda:0")
-                else:
-                    # 回退到 cuda:0
-                    input_device = torch.device("cuda:0")
-            elif isinstance(device, str) and device.startswith("cuda"):
-                # 单 GPU 模式，如 "cuda:0"
-                input_device = torch.device(device)
-            else:
-                # 其他情况（如 torch.device 对象）
-                input_device = device if isinstance(device, torch.device) else torch.device(device)
-            
-            input_encodings = planner.tokenizer(
-                inputs,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512
-            ).to(input_device)
-            
-            target_encodings = planner.tokenizer(
-                targets,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=128
-            ).to(input_device)
-            
-            # 拼接输入和输出（用于 causal LM 训练）
-            input_ids = torch.cat([input_encodings.input_ids, target_encodings.input_ids], dim=1)
-            labels = input_ids.clone()
-            # 只对输出部分计算 loss
-            labels[:, :input_encodings.input_ids.shape[1]] = -100
-            
-            # #region agent log
-            import json as _json, time as _time
-            if torch.cuda.is_available():
-                try:
-                    # 确保 log_device 是一个有效的 cuda device
-                    if isinstance(input_device, torch.device) and input_device.type == "cuda":
-                        log_device = input_device
-                    else:
-                        log_device = torch.device("cuda:0")
-                    mem_before_forward = torch.cuda.memory_allocated(log_device) / 1024**3
-                    seq_len = input_ids.shape[1]
-                    with open("/home/lxh/Project/gill-main/.cursor/debug.log", "a") as _f:
-                        _f.write(
-                            _json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "oom_debug",
-                                    "hypothesisId": "H2",
-                                    "location": "layout_planner.py:train_layout_planner",
-                                    "message": "before_forward",
-                                    "data": {
-                                        "batch_size": len(batch),
-                                        "seq_len": int(seq_len),
-                                        "log_device": str(log_device),
-                                        "mem_allocated_gb": round(mem_before_forward, 2),
-                                    },
-                                    "timestamp": int(_time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-            # #endregion
-            
-            # Forward
-            outputs = planner.model(input_ids=input_ids, labels=labels)
-            loss = outputs.loss
-            
-            # #region agent log
-            if torch.cuda.is_available():
-                try:
-                    # 确保 log_device 是一个有效的 cuda device
-                    if isinstance(input_device, torch.device) and input_device.type == "cuda":
-                        log_device = input_device
-                    else:
-                        log_device = torch.device("cuda:0")
-                    mem_after_forward = torch.cuda.memory_allocated(log_device) / 1024**3
-                    with open("/home/lxh/Project/gill-main/.cursor/debug.log", "a") as _f:
-                        _f.write(
-                            _json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "oom_debug",
-                                    "hypothesisId": "H3",
-                                    "location": "layout_planner.py:train_layout_planner",
-                                    "message": "after_forward_before_backward",
-                                    "data": {
-                                        "log_device": str(log_device),
-                                        "mem_allocated_gb": round(mem_after_forward, 2),
-                                        "loss": float(loss.item()),
-                                    },
-                                    "timestamp": int(_time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-            # #endregion
-            
-            # Backward
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            num_batches += 1
-        
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
-    
-    planner.model.eval()
-    return planner
