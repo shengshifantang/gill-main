@@ -183,26 +183,55 @@ def create_image_of_text(text: str, width: int = 224, nrows: int = 2, color=(255
 
 
 def get_feature_extractor_for_model(model_name: str, image_size: int = 224, train: bool = True):
+  if model_name is None or str(model_name).strip().lower() in {"", "none", "null"}:
+    print("Skipping feature extractor (visual encoder disabled).")
+    return None
   print(f'Using HuggingFace AutoFeatureExtractor for {model_name}.')
+  offline = os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1"
   # Check if model_name is a local path
-  # 检查是否是本地路径（相对路径或绝对路径）
+  # ????????????????????
   is_local_path = False
   if model_name.startswith('./') or model_name.startswith('../') or os.path.isabs(model_name):
     abs_path = os.path.abspath(model_name) if not os.path.isabs(model_name) else model_name
     is_local_path = os.path.exists(abs_path) and os.path.isdir(abs_path)
-  # Hub 路径（如 'openai/clip-vit-large-patch14'）不是本地路径
-  
+  # Hub ???? 'openai/clip-vit-large-patch14'???????
+
+  # Prefer local mirrors under ./model when possible
+  if not is_local_path:
+    local_root = os.environ.get("GILL_LOCAL_MODEL_DIR", "./model")
+    base_name = model_name.split("/")[-1]
+    candidates = [
+      os.path.join(local_root, base_name),
+      os.path.join(local_root, model_name.replace("/", "-")),
+      os.path.join(local_root, model_name.replace("/", os.sep)),
+    ]
+    for cand in candidates:
+      if cand and os.path.isdir(cand):
+        print(f"Loading feature extractor from local mirror: {cand}")
+        return AutoFeatureExtractor.from_pretrained(cand, local_files_only=True)
+
   if is_local_path:
     print(f"Loading feature extractor from local path: {model_name}")
-    feature_extractor = AutoFeatureExtractor.from_pretrained(model_name, local_files_only=True)
-  else:
-    feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
-  return feature_extractor
+    return AutoFeatureExtractor.from_pretrained(model_name, local_files_only=True)
+  try:
+    if offline:
+      return AutoFeatureExtractor.from_pretrained(model_name, local_files_only=True)
+    return AutoFeatureExtractor.from_pretrained(model_name)
+  except OSError:
+    if offline:
+      print(f"Warning: feature extractor '{model_name}' not found locally in offline mode. "
+            "Set --visual-encoder to a local path or disable it.")
+      return None
+    raise
 
 
 def get_pixel_values_for_model(feature_extractor, img: Image.Image):
+  if feature_extractor is None:
+    raise RuntimeError("feature_extractor is None. Provide a local visual encoder or disable vision features.")
   pixel_values = feature_extractor(img.convert('RGB'), return_tensors="pt").pixel_values[0, ...]  # (3, H, W)
   return pixel_values
+
+
 
 
 def save_checkpoint(state, is_best, filename='checkpoint'):

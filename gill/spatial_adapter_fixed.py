@@ -97,7 +97,12 @@ class GatedSelfAttentionDense(nn.Module):
         # ✅ 门控参数（初始化为 0，确保训练初期不影响原有模型）
         self.gate = nn.Parameter(torch.tensor([0.0]))
     
-    def forward(self, x: torch.Tensor, spatial_context: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        spatial_context: torch.Tensor,
+        masks: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Args:
             x: UNet 的中间特征 (B, T, query_dim)
@@ -116,7 +121,15 @@ class GatedSelfAttentionDense(nn.Module):
         
         # Attention
         scale = 1.0 / math.sqrt(self.d_head)
-        attn = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * scale, dim=-1)  # (B, H, T, N)
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, T, N)
+        if masks is not None:
+            # masks: (B, N) -> (B, 1, 1, N)
+            if masks.dim() == 2:
+                attn_mask = masks[:, None, None, :]
+            else:
+                attn_mask = masks
+            attn_logits = attn_logits.masked_fill(attn_mask <= 0, -1e4)
+        attn = torch.softmax(attn_logits, dim=-1)  # (B, H, T, N)
         attn_out = torch.matmul(attn, v)  # (B, H, T, d)
         
         # Reshape 并投影
@@ -159,11 +172,21 @@ class SpatialControlAdapter(nn.Module):
             n_heads=num_heads,
             d_head=hidden_dim // num_heads
         )
+        # 推理时可动态调节的注入强度（Scheduled Sampling）
+        self.beta_scale = 1.0
+
+    def set_scale(self, scale: float):
+        """设置注入强度（Scheduled Sampling 时使用）"""
+        try:
+            self.beta_scale = float(scale)
+        except Exception:
+            self.beta_scale = 1.0
     
     def forward(self, 
                 unet_features: torch.Tensor,
                 bboxes: torch.Tensor,
-                phrase_embeddings: Optional[torch.Tensor] = None) -> torch.Tensor:
+                phrase_embeddings: Optional[torch.Tensor] = None,
+                masks: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         在 UNet forward 过程中被调用
         
@@ -180,9 +203,14 @@ class SpatialControlAdapter(nn.Module):
             bboxes = bboxes.repeat(unet_features.shape[0], 1, 1)
         if phrase_embeddings is not None and phrase_embeddings.shape[0] == 1 and unet_features.shape[0] > 1:
             phrase_embeddings = phrase_embeddings.repeat(unet_features.shape[0], 1, 1)
+        if masks is not None and masks.shape[0] == 1 and unet_features.shape[0] > 1:
+            masks = masks.repeat(unet_features.shape[0], 1)
 
         # ✅ 对齐 dtype（防止 AMP 混合精度报错）
-        bboxes = bboxes.to(dtype=unet_features.dtype, device=unet_features.device)
+        adapter_dtype = next(self.parameters()).dtype
+        bboxes = bboxes.to(dtype=adapter_dtype, device=unet_features.device)
+        if masks is not None:
+            masks = masks.to(dtype=adapter_dtype, device=unet_features.device)
         
         # ✅ 维度匹配检查（防御性编程）
         if len(unet_features.shape) >= 2:
@@ -196,17 +224,33 @@ class SpatialControlAdapter(nn.Module):
         
         # 2. 融合位置特征和文本特征（如果有）
         if phrase_embeddings is not None:
-            phrase_embeddings = phrase_embeddings.to(dtype=unet_features.dtype, device=unet_features.device)
+            phrase_embeddings = phrase_embeddings.to(dtype=adapter_dtype, device=unet_features.device)
             # 投影到 hidden_dim
             if phrase_embeddings.shape[-1] != self.hidden_dim:
                 phrase_embeddings = self.text_proj(phrase_embeddings)
             spatial_context = box_emb + phrase_embeddings  # (B, N, hidden_dim)
         else:
             spatial_context = box_emb
+
+        # 2.1 应用 mask（过滤 padding 框）
+        attn_masks = None
+        if masks is not None:
+            spatial_context = spatial_context * masks.unsqueeze(-1)
+            attn_masks = masks
         
         # 3. 通过 Gated Self-Attention 注入
-        controlled_features = self.gated_attn(unet_features, spatial_context)
-        
+        unet_features_adapter = unet_features.to(dtype=adapter_dtype)
+        controlled_features = self.gated_attn(
+            unet_features_adapter,
+            spatial_context,
+            masks=attn_masks
+        )
+        # Scheduled Sampling: 线性缩放注入强度（0=关闭，1=全开）
+        if self.beta_scale != 1.0:
+            controlled_features = unet_features_adapter + self.beta_scale * (controlled_features - unet_features_adapter)
+        if controlled_features.dtype != unet_features.dtype:
+            controlled_features = controlled_features.to(dtype=unet_features.dtype)
+
         return controlled_features
 
 
@@ -223,6 +267,7 @@ class SpatialControlProcessor:
         # 存储 bboxes 和 phrase_embeddings（通过上下文传递）
         self.bboxes = None
         self.phrase_embeddings = None
+        self.masks = None
     
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, 
                  attention_mask=None, scale=None, **kwargs):
@@ -258,7 +303,8 @@ class SpatialControlProcessor:
                     hidden_states = self.adapter(
                         hidden_states,
                         self.bboxes,
-                        self.phrase_embeddings
+                        self.phrase_embeddings,
+                        masks=self.masks
                     )
                 except Exception as e:
                     # 防御性编程：如果注入失败，不影响原有流程
@@ -312,17 +358,76 @@ class SpatialControlProcessor:
         
         return hidden_states
     
-    def set_spatial_control(self, bboxes, phrase_embeddings=None):
+    def set_spatial_control(self, bboxes, phrase_embeddings=None, masks=None):
         """设置空间控制信息"""
         self.bboxes = bboxes
         self.phrase_embeddings = phrase_embeddings
+        self.masks = masks
 
 
 class SpatialAdapterModuleDict(nn.ModuleDict):
     """
     管理多维度 Adapter 的容器，按 hidden_dim 复用/创建
     """
-    pass
+    def set_scale(self, scale: float):
+        """递归设置所有 Adapter 的注入强度"""
+        # Avoid self.modules() here because it includes self and can recurse forever.
+        for module in self.values():
+            if hasattr(module, "set_scale"):
+                module.set_scale(scale)
+
+
+def create_spatial_adapter_for_kolors() -> SpatialAdapterModuleDict:
+    """创建用于 Kolors/SDXL 的 Adapter 容器。"""
+    return SpatialAdapterModuleDict()
+
+
+def create_spatial_adapter_for_sdxl() -> SpatialAdapterModuleDict:
+    """创建用于 SDXL 的 Adapter 容器（与 Kolors 兼容）。"""
+    return SpatialAdapterModuleDict()
+
+
+def _strip_state_dict_prefix(state_dict: Dict[str, torch.Tensor], prefix: str = "module.") -> Dict[str, torch.Tensor]:
+    if not state_dict:
+        return state_dict
+    if any(k.startswith(prefix) for k in state_dict.keys()):
+        return {k[len(prefix):]: v for k, v in state_dict.items()}
+    return state_dict
+
+
+def load_spatial_adapter_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None
+) -> SpatialAdapterModuleDict:
+    """
+    从 state_dict 恢复 SpatialAdapterModuleDict（自动构建各维度 Adapter）。
+    """
+    cleaned = _strip_state_dict_prefix(state_dict)
+    adapter_dict = SpatialAdapterModuleDict()
+    prefixes = sorted({k.split(".")[0] for k in cleaned.keys()})
+    for prefix in prefixes:
+        if not prefix.startswith("dim_"):
+            continue
+        try:
+            hidden_dim = int(prefix.split("_", 1)[1])
+        except ValueError:
+            continue
+        text_dim = None
+        text_proj_key = f"{prefix}.text_proj.weight"
+        if text_proj_key in cleaned:
+            text_dim = cleaned[text_proj_key].shape[1]
+        if text_dim is None:
+            text_dim = 4096
+        adapter_dict[prefix] = SpatialControlAdapter(
+            hidden_dim=hidden_dim,
+            text_dim=text_dim
+        )
+    if adapter_dict:
+        adapter_dict.load_state_dict(cleaned, strict=False)
+        if device is not None or dtype is not None:
+            adapter_dict = adapter_dict.to(device=device, dtype=dtype)
+    return adapter_dict
 
 
 def _get_attn_layer_dim(unet, name: str) -> Optional[int]:
@@ -373,7 +478,9 @@ def inject_spatial_control_to_unet(
     adapter_dict: Optional[SpatialAdapterModuleDict] = None,
     bboxes: Optional[torch.Tensor] = None,
     phrase_embeddings: Optional[torch.Tensor] = None,
+    masks: Optional[torch.Tensor] = None,
     num_heads: int = 8,
+    adapter_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Dict, Dict, SpatialAdapterModuleDict]:
     """
     将空间控制注入到 UNet 中（多维度适配）
@@ -383,7 +490,9 @@ def inject_spatial_control_to_unet(
         adapter_dict: 管理所有维度 Adapter 的 ModuleDict（可复用/训练）
         bboxes: (B, N, 4) 归一化坐标
         phrase_embeddings: (B, N, text_dim) 文本特征，可选
+        masks: (B, N) 有效框掩码，可选
         num_heads: 默认 8
+        adapter_dtype: Adapter 权重 dtype（默认跟随 UNet）
     
     Returns:
         processors: 原始 processors（用于恢复）
@@ -409,24 +518,27 @@ def inject_spatial_control_to_unet(
         bboxes = bboxes.to(unet_device)
     if phrase_embeddings is not None and phrase_embeddings.device != unet_device:
         phrase_embeddings = phrase_embeddings.to(unet_device)
+    if masks is not None and masks.device != unet_device:
+        masks = masks.to(unet_device)
     
     def get_or_create_adapter(layer_dim: int) -> SpatialControlAdapter:
         """获取或创建指定维度的 Adapter"""
         text_dim = phrase_embeddings.shape[-1] if phrase_embeddings is not None else 4096
         key = f"dim_{layer_dim}"
+        target_dtype = adapter_dtype if adapter_dtype is not None else unet_dtype
         
         if key not in adapter_dict:
             adapter_dict[key] = SpatialControlAdapter(
                 hidden_dim=layer_dim,
                 num_heads=num_heads,
                 text_dim=text_dim
-            ).to(device=unet_device, dtype=unet_dtype)
+            ).to(device=unet_device, dtype=target_dtype)
         else:
             # 确保设备和 dtype 匹配
             if next(adapter_dict[key].parameters()).device != unet_device:
                 adapter_dict[key] = adapter_dict[key].to(unet_device)
-            if next(adapter_dict[key].parameters()).dtype != unet_dtype:
-                adapter_dict[key] = adapter_dict[key].to(dtype=unet_dtype)
+            if next(adapter_dict[key].parameters()).dtype != target_dtype:
+                adapter_dict[key] = adapter_dict[key].to(dtype=target_dtype)
         
         return adapter_dict[key]
     
@@ -452,7 +564,7 @@ def inject_spatial_control_to_unet(
                 processors[name] = base_processor
                 spatial_processor = original_processor
                 if bboxes is not None:
-                    spatial_processor.set_spatial_control(bboxes, phrase_embeddings)
+                    spatial_processor.set_spatial_control(bboxes, phrase_embeddings, masks=masks)
                 new_processors[name] = spatial_processor
                 spatial_processors[name] = spatial_processor
                 continue
@@ -470,7 +582,7 @@ def inject_spatial_control_to_unet(
                 )
 
                 if bboxes is not None:
-                    spatial_processor.set_spatial_control(bboxes, phrase_embeddings)
+                    spatial_processor.set_spatial_control(bboxes, phrase_embeddings, masks=masks)
 
                 new_processors[name] = spatial_processor
                 spatial_processors[name] = spatial_processor
@@ -502,7 +614,7 @@ def inject_spatial_control_to_unet(
                     )
 
                     if bboxes is not None:
-                        spatial_processor.set_spatial_control(bboxes, phrase_embeddings)
+                        spatial_processor.set_spatial_control(bboxes, phrase_embeddings, masks=masks)
 
                     module.processor = spatial_processor
                     spatial_processors[name] = spatial_processor
@@ -567,4 +679,3 @@ def get_trainable_parameters(adapter_dict: SpatialAdapterModuleDict) -> List[tor
     for adapter in adapter_dict.values():
         params.extend(list(adapter.parameters()))
     return params
-

@@ -1,0 +1,43 @@
+name: gill_py310
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  # CUDA-enabled PyTorch (adjust pytorch-cuda if your driver/CUDA differs)
+  - pytorch=2.2.2
+  - torchvision=0.17.2
+  - torchaudio=2.2.2
+  - pytorch-cuda=12.1
+  # Core scientific stack
+  - numpy=1.26.4
+  - pandas=2.2.2
+  - pillow=10.3.0
+  - tqdm=4.66.4
+  - pyyaml=6.0.1
+  - requests=2.32.3
+  - regex=2024.5.15
+  - protobuf=4.25.3
+  - typing_extensions=4.12.2
+  - pip:
+      # Hugging Face stack
+      - transformers==4.45.2
+      - peft==0.12.0
+      - accelerate==0.33.0
+      - diffusers==0.30.2
+      - safetensors==0.4.3
+      - tokenizers==0.20.3
+      - huggingface-hub==0.24.6
+      # Utilities
+      - einops==0.8.0
+      - jieba==0.42.1
+      - sentencepiece==0.2.0
+      - tiktoken==0.7.0
+      # Async / annotation
+      - aiohttp==3.9.5
+      - aiofiles==23.2.1
+      - openai==1.40.0
+      # Optional (uncomment if needed)
+      # - xformers==0.0.25.post1

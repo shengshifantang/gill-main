@@ -13,6 +13,7 @@ from .spatial_adapter_fixed import (
     remove_spatial_control_from_unet,
     create_spatial_adapter_for_kolors,
     create_spatial_adapter_for_sdxl,
+    load_spatial_adapter_state_dict,
 )
 
 # 导出所有公共接口
@@ -24,4 +25,5 @@ __all__ = [
     "remove_spatial_control_from_unet",
     "create_spatial_adapter_for_kolors",
     "create_spatial_adapter_for_sdxl",
+    "load_spatial_adapter_state_dict",
 ]
