@@ -100,7 +100,7 @@ class GatedSelfAttentionDense(nn.Module):
             nn.init.zeros_(self.to_out.bias)
         
         # ✅ 门控参数（初始化为 0）
-        self.gate = nn.Parameter(torch.tensor([0.1]))
+        self.gate = nn.Parameter(torch.tensor([0.0]))
     
     def forward(
         self,

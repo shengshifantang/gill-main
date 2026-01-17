@@ -1,10 +1,11 @@
 """
 Spatial Adapter 统一入口模块
 
-为了兼容性，将 spatial_adapter_fixed.py 的内容导出为 spatial_adapter
+实现全部在 spatial_adapter_fixed.py（FP16 防溢出 clamp、GatedSelfAttention、inject 等）。
+本文件仅做 re-export，训练/推理 `from gill.spatial_adapter import ...` 时实际跑的是 _fixed 里的代码。
 """
 
-# 导入所有内容从 spatial_adapter_fixed
+# 导入所有内容从 spatial_adapter_fixed（含 SpatialControlAdapter.forward 中的 FP16 clamp）
 from .spatial_adapter_fixed import (
     SpatialPositionNet,
     SpatialAdapterModuleDict,
@@ -13,6 +14,7 @@ from .spatial_adapter_fixed import (
     remove_spatial_control_from_unet,
     create_spatial_adapter_for_kolors,
     create_spatial_adapter_for_sdxl,
+    load_spatial_adapter_state_dict,
 )
 
 # 导出所有公共接口
@@ -24,4 +26,5 @@ __all__ = [
     "remove_spatial_control_from_unet",
     "create_spatial_adapter_for_kolors",
     "create_spatial_adapter_for_sdxl",
+    "load_spatial_adapter_state_dict",
 ]

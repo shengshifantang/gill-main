@@ -1,5 +1,5 @@
 from typing import List, Optional
-from collections import namedtuple
+import re
 from diffusers import StableDiffusionPipeline
 try:
     from diffusers import KolorsPipeline
@@ -10,21 +10,44 @@ except ImportError:
 import json
 import numpy as np
 import os
-import glob
 import torch
 from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
-import pickle as pkl
-from PIL import Image, UnidentifiedImageError
-from requests.exceptions import ConnectionError
+ 
 
 from transformers import AutoTokenizer, AutoModel, CLIPVisionModel, OPTForCausalLM, AutoModelForCausalLM
 from gill import utils
 from gill import layers
-from gill import layout_planner
-from gill import spatial_adapter
-from gill import feedback_verifier
+
+_MEASURE_RE = re.compile(r"^(一|二|三|四|五|六|七|八|九|十|两|几|多|每)?(个|只|条|张|把|台|部|辆|块|片|件|根|位|名|对|双|群)")
+_NOISE_RE = re.compile(r"(正在|位于|看着|站在|坐在|躺在|趴在|穿着|拿着|走在|骑着)")
+
+
+def _clean_object_name(name: str, max_len: int = 10, min_len: int = 1) -> str:
+  if not isinstance(name, str):
+    return ""
+  name = name.strip()
+  if not name:
+    return ""
+  name = re.sub(r"<[^>]+>", "", name)
+  name = re.sub(r"[\"'“”‘’（）()《》【】\[\]{}<>]", "", name)
+  name = re.sub(r"[，,。\.、;；:：!?！？~`·•]", "", name)
+  name = re.sub(r"\s+", "", name)
+  if not name:
+    return ""
+  name = _MEASURE_RE.sub("", name)
+  if not name:
+    return ""
+  if "的" in name:
+    parts = [p for p in name.split("的") if p]
+    if parts:
+      name = parts[-1]
+  if len(name) < min_len or len(name) > max_len:
+    return ""
+  if _NOISE_RE.search(name):
+    return ""
+  return name
 
 
 class GILLArgs:
@@ -51,6 +74,7 @@ class GILLModel(nn.Module):
     super().__init__()
     self.tokenizer = tokenizer
     self.feature_extractor = utils.get_feature_extractor_for_model(args.visual_encoder, train=False)
+    self.disable_visual = args.visual_encoder is None or str(args.visual_encoder).strip().lower() in {"", "none", "null"}
     
     # 安全获取 image_token（兼容中英文模型）
     if hasattr(tokenizer, 'cls_token_id') and tokenizer.cls_token_id is not None:
@@ -94,7 +118,10 @@ class GILLModel(nn.Module):
     visual_encoder = args.visual_encoder
     n_visual_tokens = args.n_visual_tokens
     print(f"Using {opt_version} for the language model.")
-    print(f"Using {visual_encoder} for the visual model with {n_visual_tokens} visual tokens.")
+    if self.disable_visual:
+      print("Visual encoder disabled; skipping vision model load.")
+    else:
+      print(f"Using {visual_encoder} for the visual model with {n_visual_tokens} visual tokens.")
 
     print(f"当前 opt_version: {opt_version}")  # 打印opt_version，确认路径是否正确
     is_local_opt = os.path.exists(opt_version) and os.path.isdir(opt_version)
@@ -205,55 +232,60 @@ class GILLModel(nn.Module):
     # Cache to avoid printing the same prefix log line every step.
     self._prefix_log_cache = set()
 
-    print("Restoring pretrained weights for the visual model.")
-    # Check if visual_encoder is a local path
-    is_local_path = os.path.exists(visual_encoder) and os.path.isdir(visual_encoder)
-    if 'clip' in visual_encoder:
-      if is_local_path:
-        print(f"Loading CLIP model from local path: {visual_encoder}")
-        # 检查是否是 Chinese-CLIP
-        if 'chinese' in visual_encoder.lower():
-          from transformers import ChineseCLIPModel
-          full_model = ChineseCLIPModel.from_pretrained(visual_encoder, local_files_only=True, trust_remote_code=True)
-          self.visual_model = full_model.vision_model
-          print("Loaded Chinese-CLIP vision model")
+    if self.disable_visual:
+      self.visual_model = None
+      self.visual_model_name = "none"
+      hidden_size = 1024
+    else:
+      print("Restoring pretrained weights for the visual model.")
+      # Check if visual_encoder is a local path
+      is_local_path = os.path.exists(visual_encoder) and os.path.isdir(visual_encoder)
+      if 'clip' in visual_encoder:
+        if is_local_path:
+          print(f"Loading CLIP model from local path: {visual_encoder}")
+          # 检查是否是 Chinese-CLIP
+          if 'chinese' in visual_encoder.lower():
+            from transformers import ChineseCLIPModel
+            full_model = ChineseCLIPModel.from_pretrained(visual_encoder, local_files_only=True, trust_remote_code=True)
+            self.visual_model = full_model.vision_model
+            print("Loaded Chinese-CLIP vision model")
+          else:
+            self.visual_model = CLIPVisionModel.from_pretrained(visual_encoder, local_files_only=True)
         else:
-          self.visual_model = CLIPVisionModel.from_pretrained(visual_encoder, local_files_only=True)
+          self.visual_model = CLIPVisionModel.from_pretrained(visual_encoder)
       else:
-        self.visual_model = CLIPVisionModel.from_pretrained(visual_encoder)
-    else:
-      if is_local_path:
-        self.visual_model = AutoModel.from_pretrained(visual_encoder, local_files_only=True)
-      else:
-        self.visual_model = AutoModel.from_pretrained(visual_encoder)
-
-    if 'clip' in visual_encoder:
-      # 获取 hidden_size
-      if hasattr(self.visual_model, 'config'):
-        config = self.visual_model.config
-        if hasattr(config, 'hidden_size'):
-          hidden_size = config.hidden_size
-        elif hasattr(config, 'vision_config') and hasattr(config.vision_config, 'hidden_size'):
-          hidden_size = config.vision_config.hidden_size
+        if is_local_path:
+          self.visual_model = AutoModel.from_pretrained(visual_encoder, local_files_only=True)
         else:
-          # Chinese-CLIP ViT-L-14 默认 hidden_size
-          hidden_size = 1024
-        print(f"Visual model hidden_size: {hidden_size}")
+          self.visual_model = AutoModel.from_pretrained(visual_encoder)
+
+      if 'clip' in visual_encoder:
+        # 获取 hidden_size
+        if hasattr(self.visual_model, 'config'):
+          config = self.visual_model.config
+          if hasattr(config, 'hidden_size'):
+            hidden_size = config.hidden_size
+          elif hasattr(config, 'vision_config') and hasattr(config.vision_config, 'hidden_size'):
+            hidden_size = config.vision_config.hidden_size
+          else:
+            # Chinese-CLIP ViT-L-14 默认 hidden_size
+            hidden_size = 1024
+          print(f"Visual model hidden_size: {hidden_size}")
+        else:
+          hidden_size = 1024  # 默认值
+          print(f"Using default hidden_size: {hidden_size}")
       else:
-        hidden_size = 1024  # 默认值
-        print(f"Using default hidden_size: {hidden_size}")
-    else:
-      raise NotImplementedError
+        raise NotImplementedError
 
-    if self.args.freeze_vm:
-      print("Freezing the VM.")
-      self.visual_model.eval()
-      for param in self.visual_model.parameters():
-        param.requires_grad = False
-    else:
-      self.visual_model.train()
+      if self.args.freeze_vm:
+        print("Freezing the VM.")
+        self.visual_model.eval()
+        for param in self.visual_model.parameters():
+          param.requires_grad = False
+      else:
+        self.visual_model.train()
 
-    self.visual_model_name = visual_encoder
+      self.visual_model_name = visual_encoder
 
     embedding_dim = self.input_embeddings.embedding_dim * self.args.n_visual_tokens
     self.ret_text_hidden_fcs = nn.ModuleList([])
@@ -297,6 +329,8 @@ class GILLModel(nn.Module):
   def get_visual_embs(self, pixel_values: torch.FloatTensor, mode: str = 'captioning'):
     if mode not in ['captioning', 'retrieval', 'generation']:
       raise ValueError(f"mode should be one of ['captioning', 'retrieval', 'generation'], got {mode} instead.")
+    if self.visual_model is None:
+      raise RuntimeError("Visual encoder is disabled; cannot compute visual embeddings.")
 
     # Extract visual embeddings from the vision encoder.
     if 'clip' in self.visual_model_name:
@@ -323,13 +357,13 @@ class GILLModel(nn.Module):
   def train(self, mode=True):
     # DDP Fix: Ensure frozen models stay in eval mode during training
     lm_was_eval = self.args.freeze_lm and not self.lm.training
-    vm_was_eval = self.args.freeze_vm and not self.visual_model.training
+    vm_was_eval = self.visual_model is not None and self.args.freeze_vm and not self.visual_model.training
     
     super(GILLModel, self).train(mode=mode)
     
     if self.args.freeze_lm and lm_was_eval:
       self.lm.eval()
-    if self.args.freeze_vm and vm_was_eval:
+    if self.visual_model is not None and self.args.freeze_vm and vm_was_eval:
       self.visual_model.eval()
 
 
@@ -691,110 +725,15 @@ class GILLModel(nn.Module):
 
     return output, full_labels, last_embedding, last_output_logit, visual_embs, visual_embs_norm, input_embs_norm, llm_hidden_states
 
-  def generate(self, embeddings = torch.FloatTensor, max_len: int = 32,
-               temperature: float = 0.0, top_p: float = 1.0, min_word_tokens: int = 0,
-               ret_scale_factor: float = 1.0, gen_scale_factor: float = 1.0,
-               filter_value: float = -float('Inf')):
-    """Runs greedy decoding and returns generated captions.
-
-    Args:
-      min_word_tokens: Minimum number of words to generate before allowing a [IMG] output.
-      filter_value: Value to assign to tokens that should never be generated.
-    Outputs:
-      out: (N, T) int32 sequence of output tokens.
-      output_embeddings: (N, T, 256) sequence of text output embeddings.
-    """
-    self.lm.eval()
-
-    with torch.no_grad():  # no tracking history
-      # init output with image tokens
-      out = None
-      output_embeddings = []
-      output_logits = []
-
-      for i in range(max_len):
-        output = self.lm(inputs_embeds=embeddings, use_cache=False, output_hidden_states=True)
-
-        for idx in self.args.text_emb_layers:
-          output_embeddings.append(output.hidden_states[idx])
-
-        logits = output.logits[:, -1, :]  # (N, vocab_size)
-        if top_p == 1.0:
-          logits = logits.cpu()
-        output_logits.append(logits)
-
-        # Prevent the model from generating the [IMG1..n] tokens.
-        logits[:, self.retrieval_token_idx[1:]] = filter_value
-        logits[:, self.gen_token_idx[1:]] = filter_value
-
-        if (self.retrieval_token_idx or self.gen_token_idx) and self.retrieval_token_idx[0] != -1 and self.gen_token_idx[0] != -1:
-          if i < min_word_tokens:
-            # Eliminate probability of generating [IMG] if this is earlier than min_word_tokens.
-            logits[:, self.retrieval_token_idx] = filter_value
-            logits[:, self.gen_token_idx] = filter_value
-          else:
-            # Multiply by scaling factor.
-            if ret_scale_factor > 1:
-              logits[:, self.retrieval_token_idx[0]] = logits[:, self.retrieval_token_idx[0]].abs() * ret_scale_factor
-            if gen_scale_factor > 1:
-              logits[:, self.gen_token_idx[0]] = logits[:, self.gen_token_idx[0]].abs() * gen_scale_factor
-
-        if temperature == 0.0:
-          if top_p != 1.0:
-            raise ValueError('top_p cannot be set if temperature is 0 (greedy decoding).')
-          next_token = torch.argmax(logits, keepdim=True, dim=-1)  # (N, 1)
-        else:
-          logits = logits / temperature
-
-          # Apply top-p filtering.
-          if top_p < 1.0:
-            assert top_p > 0, f'top_p should be above 0, got {top_p} instead.'
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)  # (N, D) and (N, D)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1) # (N, D)
-
-            # Remove tokens with cumulative probability above the threshold
-            sorted_indices_to_remove = cumulative_probs > top_p
-            # Shift the indices to the right to keep also the first token above the threshold
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-
-            for j in range(sorted_indices.shape[0]):
-              indices_to_remove = sorted_indices[j, sorted_indices_to_remove[j, :]]
-              logits[j, indices_to_remove] = filter_value
-
-          token_weights = logits.exp()   # (N, vocab_size)
-          next_token = torch.multinomial(token_weights, 1)  # (N, 1)
-
-        # Force generation of the remaining [IMG] tokens if [IMG0] is generated.
-        if next_token.shape[0] == 1 and next_token.item() == self.retrieval_token_idx[0]:
-          assert self.retrieval_token_idx == self.gen_token_idx, (self.retrieval_token_idx, self.gen_token_idx)
-          next_token = torch.tensor(self.retrieval_token_idx)[None, :].long().to(embeddings.device)  # (1, num_tokens)
-        else:
-          next_token = next_token.long().to(embeddings.device)
-
-        if out is not None:
-          out = torch.cat([out, next_token], dim=-1)
-        else:
-          out = next_token
-
-        next_embedding = self.input_embeddings(next_token)
-        embeddings = torch.cat([embeddings, next_embedding], dim=1)
-
-    return out, output_embeddings, output_logits
-
-
 class GILL(nn.Module):
   def __init__(self, tokenizer, model_args: Optional[GILLArgs] = None,
                path_array: Optional[List[str]] = None, emb_matrix: Optional[torch.tensor] = None,
                load_sd: bool = False, num_gen_images: int = 1, decision_model_path: Optional[str] = None, device_map: Optional[str] = None):
     super().__init__()
+    # Keep signature for compatibility; unused args are ignored.
     self.model = GILLModel(tokenizer, model_args, device_map=device_map)
-    self.path_array = path_array
-    self.emb_matrix = emb_matrix
     self.load_sd = load_sd
     self.num_gen_images = num_gen_images
-    self.idx2dec = {0: 'gen', 1: 'ret', 2: 'same'}
-    self.decision_model = None
 
     # Load the Stable Diffusion model.
     # 支持指定不同GPU加载图像生成模型
@@ -807,6 +746,7 @@ class GILL(nn.Module):
       # 优先使用Kolors（中文优化），然后是SD v1.5
       kolors_path = "./model/Kolors"
       sd_v15_path = "./model/stable-diffusion-v1-5"
+      offline = os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1"
       
       print(f"📦 图像生成模型将加载到: {self.sd_device}")
       
@@ -839,6 +779,8 @@ class GILL(nn.Module):
           print("   回退到Stable Diffusion v1.5...")
           if os.path.exists(sd_v15_path):
             model_id = sd_v15_path
+          elif offline:
+            raise RuntimeError("Kolors failed and offline mode is enabled, but local stable-diffusion-v1-5 not found. Free GPU memory or provide ./model/stable-diffusion-v1-5.")
           else:
             model_id = "runwayml/stable-diffusion-v1-5"
           self.sd_pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to(self.sd_device)
@@ -852,15 +794,7 @@ class GILL(nn.Module):
         model_id = "runwayml/stable-diffusion-v1-5"
         self.sd_pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
 
-    if decision_model_path is not None:
-      print('Loading decision model...')
-      self.decision_model = nn.Sequential(*[
-          nn.Dropout(0.5),
-          nn.Linear(4096, 2),
-      ])
-      mlp_checkpoint = torch.load(decision_model_path)
-      self.decision_model.load_state_dict(mlp_checkpoint['state_dict'], strict=True)
-      self.decision_model.eval()
+    # Decision model / retrieval branch removed (not used in current pipeline).
 
   def __call__(self, images: Tensor, tgt_tokens: Optional[Tensor] = None, caption_len: Optional[Tensor] = None,
                generate: bool = False, num_words: int = 32, temperature: float = 1.0, top_p: float = 1.0,
@@ -868,303 +802,123 @@ class GILL(nn.Module):
                min_word_tokens: int = 0, mode: str = 'captioning', concat_captions: bool = False,
                input_prefix: Optional[str] = None) -> Tensor:
     if generate:
-      return self.model.generate(images, num_words, temperature=temperature, top_p=top_p,
-                                 min_word_tokens=min_word_tokens, ret_scale_factor=ret_scale_factor,
-                                 gen_scale_factor=gen_scale_factor)
-    else:
-      output = self.model(
-        pixel_values = images,
-        labels = tgt_tokens,
-        caption_len = caption_len,
-        mode = mode,
-        concat_captions = concat_captions,
-        input_prefix = input_prefix)
-      return output
+      raise NotImplementedError("GILL image-token generation was removed; use Kolors/SD prompt generation.")
+    output = self.model(
+      pixel_values = images,
+      labels = tgt_tokens,
+      caption_len = caption_len,
+      mode = mode,
+      concat_captions = concat_captions,
+      input_prefix = input_prefix)
+    return output
 
-  def generate_for_images_and_texts(
-    self, prompts: List, num_words: int = 0, min_word_tokens: int = 0, ret_scale_factor: float = 1.0, gen_scale_factor: float = 1.0,
-    top_p: float = 1.0, temperature: float = 0.0, max_num_rets: int = 1, generator=None, 
-    always_add_bos : bool = False, guidance_scale: float = 7.5, num_inference_steps: int = 50):
-    """
-    Encode prompts into embeddings, and generates text and image outputs accordingly.
-
-    Args:
-      prompts: List of interleaved PIL.Image.Image and strings representing input to the model.
-      num_words: Maximum number of words to generate for. If num_words = 0, the model will run its forward pass and return the outputs.
-      min_word_tokens: Minimum number of actual words before generating an image.
-      ret_scale_factor: Proportion to scale [IMG] token logits by. A higher value may increase the probability of the model generating [IMG] outputs.
-      top_p: If set to < 1, the smallest set of tokens with highest probabilities that add up to top_p or higher are kept for generation.
-      temperature: Used to modulate logit distribution.
-      max_num_rets: Maximum number of images to return in one generation pass.
-    Returns:
-      return_outputs: List consisting of either str or List[PIL.Image.Image] objects, representing image-text interleaved model outputs.
-    """
-    input_embs = []
-    input_ids = []
-    add_bos = True
-
+  def _generate_text_prompt(self, prompt: str, max_new_tokens: int = 64) -> str:
+    """Generate a semantic prompt using the LM only (no GILL mapper)."""
+    if self.model is None or self.model.lm is None:
+      return prompt
+    tokenizer = self.model.tokenizer
+    device = self.model.lm.device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
     with torch.no_grad():
-      for p in prompts:
-        if type(p) == Image.Image:
-          # Encode as image.
-          pixel_values = utils.get_pixel_values_for_model(self.model.feature_extractor, p)
-          pixel_values = pixel_values.to(device=self.model.logit_scale.device, dtype=self.model.logit_scale.dtype)
-          pixel_values = pixel_values[None, ...]
+      out = self.model.lm.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+      )
+    gen_ids = out[0][inputs.input_ids.shape[1]:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
-          visual_embs = self.model.get_visual_embs(pixel_values, mode='captioning')  # (1, n_visual_tokens, D)
-          input_embs.append(visual_embs)
-        elif type(p) == str:
-          text_ids = self.model.tokenizer(p, add_special_tokens=add_bos, return_tensors="pt").input_ids.to(self.model.logit_scale.device)
-          # Only add <bos> once unless the flag is set.
-          if not always_add_bos:
-            add_bos = False
-
-          text_embs = self.model.input_embeddings(text_ids)  # (1, T, D)
-          input_embs.append(text_embs)
-          input_ids.append(text_ids)
-        else:
-          raise ValueError(f'Input prompts should be either PIL.Image.Image or str types, got {type(p)} instead.')
-      input_embs = torch.cat(input_embs, dim=1)
-      input_ids = torch.cat(input_ids, dim=1)
-
-      if num_words == 0:
-        raise NotImplementedError('Generation not implemented for num_words=0.')
-      elif num_words > 0:
-        generated_ids, generated_embeddings, _ = self.model.generate(input_embs, num_words, min_word_tokens=min_word_tokens,
-          temperature=temperature, top_p=top_p, ret_scale_factor=ret_scale_factor, gen_scale_factor=gen_scale_factor)
-        embeddings = generated_embeddings[-1][:, input_embs.shape[1]:]
-
-        # Truncate to newline.
-        newline_token_id = self.model.tokenizer('\n', add_special_tokens=False).input_ids[0]
-        trunc_idx = 0
-        for j in range(generated_ids.shape[1]):
-          if generated_ids[0, j] == newline_token_id:
-            trunc_idx = j
-            break
-        if trunc_idx > 0:
-          generated_ids = generated_ids[:, :trunc_idx]
-          embeddings = embeddings[:, :trunc_idx]
-      else:
-        raise ValueError
-
-      # Save outputs as an interleaved list.
-      return_outputs = []
-      # Find up to max_num_rets [IMG] tokens, and their corresponding scores.
-      all_ret_idx = [i for i, x in enumerate(generated_ids[0, :] == self.model.retrieval_token_idx[0]) if x][:max_num_rets]
-      seen_image_idx = []  # Avoid showing the same image multiple times.
-
-      last_ret_idx = 0
-      if len(all_ret_idx) == 0:
-        # No [IMG] tokens.
-        caption = self.model.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        return_outputs.append(utils.truncate_caption(caption))
-      else:
-        for ret_idx in all_ret_idx:
-          assert generated_ids[0, ret_idx:ret_idx+self.model.num_tokens].cpu().detach().numpy().tolist() == self.model.retrieval_token_idx, (generated_ids[0, ret_idx:ret_idx+self.model.num_tokens], self.model.retrieval_token_idx)
-          raw_emb = embeddings[:, ret_idx:ret_idx+self.model.num_tokens, :]  # (1, 8, 4096)
-          assert len(self.model.args.text_emb_layers) == 1
-
-          image_outputs = {
-            'gen': [],
-            'ret': [],
-            'decision': None,
-          }
-
-          if self.emb_matrix is not None:
-            # Produce retrieval embedding.
-            ret_emb = self.model.ret_text_hidden_fcs[0](raw_emb, None)[:, 0, :]  # (1, 256)
-            ret_emb = ret_emb / ret_emb.norm(dim=-1, keepdim=True)
-            ret_emb = ret_emb.type(self.emb_matrix.dtype)  # (1, 256)
-            scores = self.emb_matrix @ ret_emb.T
-
-            # Downweight seen images.
-            for seen_idx in seen_image_idx:
-              scores[seen_idx, :] -= 1000
-
-            # Get the top 3 images for each image.
-            _, top_image_idx = scores.squeeze().topk(3)
-            for img_idx in top_image_idx:
-              # Find the first image that does not error out.
-              try:
-                seen_image_idx.append(img_idx)
-                img = utils.get_image_from_url(self.path_array[img_idx])
-                image_outputs['ret'].append((img, 'ret', scores[img_idx].item()))
-                if len(image_outputs) == max_num_rets:
-                  break
-              except (UnidentifiedImageError, ConnectionError, OSError):
-                pass
-
-            # Make decision with MLP.
-            if self.decision_model is not None:
-              decision_emb = raw_emb[:, 0, :]  # (1, 4096)
-              assert decision_emb.shape[1] == 4096, decision_emb.shape
-              decision_logits = self.decision_model(decision_emb)
-              probs = decision_logits.softmax(dim=-1).cpu().float().numpy().tolist()
-              image_outputs['decision'] = [self.idx2dec[decision_logits.argmax().item()]] + probs
-          else:
-            # If no embedding matrix is provided, generate instead.
-            image_outputs['decision'] = ['gen', [0, 1]]
-
-          # Produce generation embedding.
-          gen_prefix = ''.join([f'[IMG{i}]' for i in range(self.model.args.num_tokens)])
-          gen_prefx_ids = self.model.tokenizer(gen_prefix, add_special_tokens=False, return_tensors="pt").input_ids.to(self.model.logit_scale.device)
-          gen_prefix_embs = self.model.input_embeddings(gen_prefx_ids)  # (1, T, D)
-          
-          # 检查是否需要 pooled embedding (Kolors 配置)
-          gen_fc = self.model.gen_text_hidden_fcs[0]
-          pooled_emb = None
-          if hasattr(gen_fc, 'output_pooled') and gen_fc.output_pooled:
-            gen_emb, pooled_emb = gen_fc(raw_emb, gen_prefix_embs, return_pooled=True)
-            # gen_emb: (1, num_clip_tokens, gen_emb_dim)
-            # pooled_emb: (1, gen_emb_dim)
-          else:
-            gen_emb = gen_fc(raw_emb, gen_prefix_embs)  # (1, 77, 768)
-          
-          # 获取目标维度
-          target_seq_len = self.model.args.num_clip_tokens
-          target_emb_dim = self.model.args.gen_emb_dim
-
-          if gen_emb.shape[1] != target_seq_len:
-            print(f"Padding {gen_emb.shape} to target ({target_seq_len}, {target_emb_dim})")
-            bs = gen_emb.shape[0]
-            gen_emb = gen_emb.reshape(bs, -1, target_emb_dim)  # (bs, T, D)
-            seq_len = gen_emb.shape[1]
-            if seq_len < target_seq_len:
-              gen_emb = torch.cat([gen_emb, torch.zeros((bs, target_seq_len - seq_len, target_emb_dim), device=gen_emb.device, dtype=gen_emb.dtype)], dim=1)
-            print('Padded to', gen_emb.shape)
-
-          gen_emb = gen_emb.repeat(self.num_gen_images, 1, 1)  # (self.num_gen_images, seq_len, emb_dim)
-          if pooled_emb is not None:
-            pooled_emb = pooled_emb.repeat(self.num_gen_images, 1)  # (self.num_gen_images, emb_dim)
-
-          # OPTIM(jykoh): Only generate if scores are low.
-          if self.load_sd:
-            # If num_gen_images > 8, split into multiple batches (for GPU memory reasons).
-            gen_max_bs = 8
-            gen_images = []
-            
-            # 获取生成前的文本作为 prompt（备用）
-            text_prompt = self.model.tokenizer.batch_decode(
-                generated_ids[:, last_ret_idx:ret_idx], 
-                skip_special_tokens=True
-            )[0]
-            
-            for i in range(0, self.num_gen_images, gen_max_bs):
-              if self.is_kolors:
-                # Kolors 模式
-                if pooled_emb is not None and gen_emb.shape[-1] == 2048:
-                  # 使用训练好的 embedding (Kolors 适配版)
-                  print(f"使用 Kolors embedding 生成: prompt_embeds={gen_emb.shape}, pooled={pooled_emb.shape}")
-                  gen_images.extend(
-                    self.sd_pipe(
-                      prompt_embeds=gen_emb[i:i+gen_max_bs].half(),
-                      pooled_prompt_embeds=pooled_emb[i:i+gen_max_bs].half(),
-                      generator=generator,
-                      guidance_scale=guidance_scale, 
-                      num_inference_steps=num_inference_steps,
-                      height=1024,
-                      width=1024
-                    ).images)
-                else:
-                  # 回退到文本 prompt（旧模型或维度不匹配）
-                  print(f"使用文本 prompt 生成: {text_prompt[:50]}...")
-                  gen_images.extend(
-                    self.sd_pipe(
-                      prompt=text_prompt if text_prompt else "一张美丽的图片",
-                      generator=generator,
-                      guidance_scale=guidance_scale, 
-                      num_inference_steps=num_inference_steps,
-                      height=1024,
-                      width=1024
-                    ).images)
-              else:
-                # SD v1.5 使用 prompt_embeds
-                gen_images.extend(
-                  self.sd_pipe(prompt_embeds=gen_emb[i:i+gen_max_bs], generator=generator,
-                               guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images)
-
-            all_gen_pixels = []
-            for img in gen_images:
-              pixel_values = utils.get_pixel_values_for_model(self.model.feature_extractor, img.resize((224, 224)).convert('RGB'))
-              pixel_values = pixel_values.to(device=self.model.logit_scale.device, dtype=self.model.logit_scale.dtype)
-              all_gen_pixels.append(pixel_values)
-            
-            if self.emb_matrix is not None:
-              all_gen_pixels = torch.stack(all_gen_pixels, dim=0)
-              gen_visual_embs = self.model.get_visual_embs(all_gen_pixels, mode='retrieval')  # (1, D)
-              gen_visual_embs = gen_visual_embs / gen_visual_embs.norm(dim=-1, keepdim=True)
-              gen_visual_embs = gen_visual_embs.type(self.emb_matrix.dtype)
-              gen_rank_scores = (gen_visual_embs @ ret_emb.T).squeeze()
-              sorted_score_idx = torch.argsort(-gen_rank_scores)
-
-              # Rank images by retrieval score.
-              if self.num_gen_images > 1:
-                image_outputs['gen'] = [(gen_images[idx], gen_rank_scores[idx].item()) for idx in sorted_score_idx]
-              else:
-                image_outputs['gen'] = [(gen_images[0], gen_rank_scores.item())]
-            else:
-              image_outputs['gen'] = [(gen_images[0], 0)]
-          else:
-            image_outputs['gen'] = [gen_emb]
-
-          caption = self.model.tokenizer.batch_decode(generated_ids[:, last_ret_idx:ret_idx], skip_special_tokens=True)[0]
-          last_ret_idx = ret_idx + 1
-          return_outputs.append(utils.truncate_caption(caption) + f' {gen_prefix}')
-          return_outputs.append(image_outputs)
-
-    return return_outputs
-
-  def get_log_likelihood_scores(
-    self, prompts: List):
+  def _encode_objects(self, object_names: List[str], device: torch.device) -> Optional[torch.Tensor]:
     """
-    Output the log likelihood of the given interleaved prompts.
-
-    Args:
-      prompts: List of interleaved PIL.Image.Image and strings representing input to the model.
-    Returns:
-      Log likelihood score of the prompt sequence.
+    Encode object names into phrase embeddings for the spatial adapter.
+    Returns a tensor of shape (1, N, hidden) in float32 or None if unavailable.
     """
-    input_embs = []
-    input_ids = []
-    add_bos = True
+    if not object_names:
+      return torch.zeros((1, 0, 4096), device=device, dtype=torch.float32)
+    if self.sd_pipe is None or not hasattr(self.sd_pipe, "tokenizer") or self.sd_pipe.tokenizer is None:
+      return None
+    text_encoder = getattr(self.sd_pipe, "text_encoder", None)
+    if text_encoder is None:
+      return None
 
-    for p in prompts:
-      if type(p) == Image.Image:
-        # Encode as image.
-        pixel_values = utils.get_pixel_values_for_model(self.model.feature_extractor, p)
-        pixel_values = pixel_values.to(device=self.model.logit_scale.device, dtype=self.model.logit_scale.dtype)
-        pixel_values = pixel_values[None, ...]
+    names = [_clean_object_name(str(n)) for n in object_names]
+    hidden = getattr(text_encoder.config, "hidden_size", 4096)
+    phrase_emb = torch.zeros((len(names), hidden), device=device, dtype=torch.float32)
 
-        visual_embs = self.model.get_visual_embs(pixel_values, mode='captioning')  # (1, n_visual_tokens, D)
-        input_embs.append(visual_embs)
-        id_ = torch.zeros(visual_embs.shape[:2], dtype=torch.int64).to(visual_embs.device) - 100
-        input_ids.append(id_)
-      elif type(p) == str:
-        text_ids = self.model.tokenizer(p, add_special_tokens=True, return_tensors="pt").input_ids.to(self.model.logit_scale.device)
-        if not add_bos:
-          # Remove <bos> tag.
-          text_ids = text_ids[:, 1:]
-        else:
-          # Only add <bos> once.
-          add_bos = False
+    valid_indices = [i for i, n in enumerate(names) if n]
+    if not valid_indices:
+      return phrase_emb.unsqueeze(0)
 
-        text_embs = self.model.input_embeddings(text_ids)  # (1, T, D)
-        input_embs.append(text_embs)
-        input_ids.append(text_ids)
+    valid_names = [names[i] for i in valid_indices]
+    tokenizer = self.sd_pipe.tokenizer
+    original_pad = None
+    try:
+      if tokenizer is not None and hasattr(tokenizer, "_pad"):
+        original_pad = tokenizer._pad
+        def compatible_pad(encoded_inputs, max_length=None, padding_strategy=None, pad_to_multiple_of=None, return_attention_mask=None, **kwargs):
+          kwargs.pop("padding_side", None)
+          return original_pad(encoded_inputs, max_length, padding_strategy, pad_to_multiple_of, return_attention_mask, **kwargs)
+        tokenizer._pad = compatible_pad
+
+      tok_inputs = tokenizer(
+        valid_names,
+        padding=True,
+        truncation=True,
+        max_length=32,
+        return_tensors="pt"
+      ).to(device)
+      with torch.no_grad():
+        tok_outputs = text_encoder(**tok_inputs)
+      attn_mask = tok_inputs.get("attention_mask", None)
+      if hasattr(tok_outputs, "last_hidden_state"):
+        last_hidden = tok_outputs.last_hidden_state
+      elif isinstance(tok_outputs, (tuple, list)) and len(tok_outputs) > 0:
+        last_hidden = tok_outputs[0]
       else:
-        raise ValueError(f'Input prompts should be either PIL.Image.Image or str types, got {type(p)} instead.')
-    input_embs = torch.cat(input_embs, dim=1)
-    input_ids = torch.cat(input_ids, dim=1)
+        last_hidden = tok_outputs
 
-    outputs = self.model.lm(inputs_embeds=input_embs, labels=input_ids, use_cache=False, output_hidden_states=True)
-    return -outputs.loss.item()  
+      # ChatGLM-style output can be (seq_len, batch, hidden); align to (batch, seq, hidden).
+      input_ids = tok_inputs.get("input_ids", None)
+      expected_bs = input_ids.shape[0] if input_ids is not None else len(valid_names)
+      if last_hidden.dim() == 3 and last_hidden.size(0) != expected_bs and last_hidden.size(1) == expected_bs:
+        last_hidden = last_hidden.transpose(0, 1)
+      # If batch still mismatches (e.g., duplicated rows), trim to expected size.
+      if last_hidden.dim() == 3 and last_hidden.size(0) != expected_bs and last_hidden.size(0) > expected_bs:
+        last_hidden = last_hidden[:expected_bs]
+
+      if attn_mask is None or last_hidden.size(0) != attn_mask.size(0):
+        pooled = last_hidden.mean(dim=1)
+      else:
+        # Align seq lengths in case tokenizer/text_encoder mismatch
+        seq_len = min(last_hidden.size(1), attn_mask.size(1))
+        hs = last_hidden[:, :seq_len, :]
+        mask = attn_mask[:, :seq_len].unsqueeze(-1).float()
+        pooled = (hs * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+      phrase_emb[valid_indices] = pooled.to(dtype=torch.float32)
+    except Exception as e:
+      print(f"?? Phrase embedding encoding failed: {e}")
+    finally:
+      if original_pad is not None and tokenizer is not None:
+        tokenizer._pad = original_pad
+
+    return phrase_emb.unsqueeze(0)
 
   def generate_with_layout(self, prompt: str, enable_layout: bool = True, 
                           enable_feedback: bool = False, layout_planner=None,
                           spatial_adapter=None, feedback_verifier=None,
                           num_words: int = 15, guidance_scale: float = 7.5,
                           num_inference_steps: int = 50, generator=None,
-                          max_retries: int = 3):
+                          scheduled_sampling_ratio: float = 0.4,
+                          adapter_scale: float = 1.0,
+                          disable_phrase_emb: bool = False,
+                          use_gill_prompt: bool = False,
+                          max_retries: int = 3,
+                          strict_entities: bool = False,
+                          enable_cot: bool = False,
+                          force_gate: bool = False,
+                          gate_value: float = 1.0):
     """
     带布局控制的图像生成（Plan → Generate → Verify 闭环）
     """
@@ -1192,13 +946,21 @@ class GILL(nn.Module):
       # Step 1: 布局规划
       objects = None
       bboxes = None
+      object_names = None
       layout_result = None
       if enable_layout and layout_planner is not None:
-        layout_result = layout_planner.generate_layout(current_prompt, apply_refinement=True)
+        layout_result = layout_planner.generate_layout(
+          current_prompt,
+          apply_refinement=True,
+          strict_entities=strict_entities,
+          enable_cot=enable_cot,
+        )
         result["layout"] = layout_result
         objects = layout_result.get("objects") if layout_result else None
         if objects:
+          object_names = [str(obj.get("name", "")).strip() for obj in objects]
           bboxes = torch.tensor([obj["bbox"] for obj in objects], dtype=torch.float32).unsqueeze(0)
+          bboxes = torch.clamp(bboxes, 0.0, 1.0)
       
       # Step 2: 注入 Spatial Adapter（动态按层维度）
       original_processors = None
@@ -1220,16 +982,40 @@ class GILL(nn.Module):
             bboxes = bboxes.to(unet_device)
           except (StopIteration, AttributeError):
             if hasattr(self, 'sd_device') and self.sd_device != 'cpu':
-              bboxes = bboxes.to(self.sd_device)
+              unet_device = self.sd_device
+              bboxes = bboxes.to(unet_device)
             else:
-              bboxes = bboxes.to('cpu')
+              unet_device = 'cpu'
+              bboxes = bboxes.to(unet_device)
           
+          masks = None
+          phrase_embeddings = None
+          if objects:
+            masks = torch.ones((1, len(objects)), device=bboxes.device, dtype=torch.float32)
+            if self.is_kolors and not disable_phrase_emb:
+              phrase_embeddings = self._encode_objects(object_names or [], unet_device)
+
           original_processors, spatial_processors, adapter_container = inject_spatial_control_to_unet(
             self.sd_pipe.unet,
             adapter_container,
             bboxes=bboxes,
-            phrase_embeddings=None
+            phrase_embeddings=phrase_embeddings,
+            masks=masks,
+            adapter_dtype=torch.float32
           )
+          if force_gate and adapter_container is not None:
+            forced = 0
+            modules = adapter_container.values() if isinstance(adapter_container, SpatialAdapterModuleDict) else [adapter_container]
+            for module in modules:
+              gated_attn = getattr(module, "gated_attn", None)
+              gate = getattr(gated_attn, "gate", None)
+              if gate is not None:
+                gate.data.fill_(float(gate_value))
+                forced += 1
+            if forced:
+              print(f"   Forced gate={float(gate_value)} on {forced} adapters")
+          if adapter_container is not None and hasattr(adapter_container, "set_scale"):
+            adapter_container.set_scale(float(adapter_scale))
           print(f"✓ Spatial Adapter 已注入到 {len(spatial_processors)} 个 attention 层")
           print(f"   布局对象数: {len(objects) if objects else 0}")
           print(f"   BBoxes shape: {bboxes.shape}, device: {bboxes.device}")
@@ -1237,9 +1023,51 @@ class GILL(nn.Module):
         # Step 3: 语义生成 / 路径选择
         generated_image = None
         if self.is_kolors and self.sd_pipe is not None:
-          print("🚀 使用 Kolors 原生文本生成 (Bypass GILLMapper)...")
+          if use_gill_prompt:
+            try:
+              semantic_prompt = self._generate_text_prompt(current_prompt, max_new_tokens=max(num_words, 32))
+              if semantic_prompt:
+                current_prompt = semantic_prompt
+              result["semantic_prompt"] = semantic_prompt or current_prompt
+              print("🧠 使用 GILL 生成语义 prompt -> Kolors")
+            except Exception as e:
+              print(f"?? GILL 语义生成失败，回退到原始 prompt: {e}")
+              result["semantic_prompt"] = current_prompt
+              print("🚀 使用 Kolors 原生文本生成 (Bypass GILLMapper)...")
+          else:
+            print("🚀 使用 Kolors 原生文本生成 (Bypass GILLMapper)...")
+            result["semantic_prompt"] = current_prompt
           original_pad = None
           try:
+            # Scheduled Sampling 回调：前半段启用控制，后半段关闭
+            callback_kwargs = {}
+            def gligen_scheduled_callback(pipe, step_index, timestep, callback_kwargs_in):
+              if adapter_container is None:
+                return callback_kwargs_in
+              if scheduled_sampling_ratio is None:
+                return callback_kwargs_in
+              total_steps = max(int(num_inference_steps), 1)
+              progress = float(step_index) / float(total_steps)
+              base_scale = float(adapter_scale)
+              target_scale = base_scale if progress < float(scheduled_sampling_ratio) else 0.0
+              if hasattr(adapter_container, "set_scale"):
+                adapter_container.set_scale(target_scale)
+              else:
+                for module in adapter_container.modules():
+                  if hasattr(module, "set_scale"):
+                    module.set_scale(target_scale)
+              return callback_kwargs_in
+
+            if scheduled_sampling_ratio is not None:
+              callback_kwargs["callback_on_step_end"] = gligen_scheduled_callback
+
+            def _pipe_call(**kwargs):
+              try:
+                return self.sd_pipe(**kwargs, **callback_kwargs).images[0]
+              except TypeError:
+                # 兼容不支持 callback_on_step_end 的 diffusers 版本
+                return self.sd_pipe(**kwargs).images[0]
+
             if hasattr(self.sd_pipe, 'tokenizer') and self.sd_pipe.tokenizer is not None and hasattr(self.sd_pipe.tokenizer, '_pad'):
               original_pad = self.sd_pipe.tokenizer._pad
               def compatible_pad(encoded_inputs, max_length=None, padding_strategy=None, pad_to_multiple_of=None, return_attention_mask=None, **kwargs):
@@ -1249,7 +1077,7 @@ class GILL(nn.Module):
             
             negative_prompt = ""
             try:
-              generated_image = self.sd_pipe(
+              generated_image = _pipe_call(
                 prompt=current_prompt,
                 negative_prompt=negative_prompt,
                 guidance_scale=guidance_scale,
@@ -1257,25 +1085,25 @@ class GILL(nn.Module):
                 height=1024,
                 width=1024,
                 generator=generator
-              ).images[0]
+              )
             except (TypeError, ValueError):
               print("  ℹ️ 尝试不使用 height/width 参数...")
               try:
-                generated_image = self.sd_pipe(
+                generated_image = _pipe_call(
                   prompt=current_prompt,
                   negative_prompt=negative_prompt,
                   guidance_scale=guidance_scale,
                   num_inference_steps=num_inference_steps,
                   generator=generator
-                ).images[0]
+                )
               except Exception:
                 print("  ℹ️ 尝试不提供 negative_prompt 参数...")
-                generated_image = self.sd_pipe(
+                generated_image = _pipe_call(
                   prompt=current_prompt,
                   guidance_scale=guidance_scale,
                   num_inference_steps=num_inference_steps,
                   generator=generator
-                ).images[0]
+                )
           except Exception as e:
             print(f"⚠️ Kolors 直接生成失败: {e}")
             import traceback
@@ -1283,32 +1111,34 @@ class GILL(nn.Module):
           finally:
             if original_pad is not None and hasattr(self.sd_pipe, 'tokenizer'):
               self.sd_pipe.tokenizer._pad = original_pad
-          result["semantic_prompt"] = current_prompt
         else:
-          model_outputs = self.generate_for_images_and_texts(
-            [current_prompt],
-            num_words=num_words,
-            ret_scale_factor=1.0,
-            gen_scale_factor=1.0,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_inference_steps,
-            generator=generator
-          )
-          
-          for output in model_outputs:
-            if isinstance(output, dict) and 'gen' in output and 'text' in output:
-              result["semantic_prompt"] = output['text']
-              break
-          
-          for output in model_outputs:
-            if isinstance(output, dict) and 'gen' in output and len(output['gen']) > 0:
-              generated_image = output['gen'][0][0]
-              break
+          # Non-Kolors fallback: prompt-to-image only.
+          if use_gill_prompt:
+            try:
+              semantic_prompt = self._generate_text_prompt(current_prompt, max_new_tokens=max(num_words, 32))
+              if semantic_prompt:
+                current_prompt = semantic_prompt
+              result["semantic_prompt"] = semantic_prompt or current_prompt
+            except Exception as e:
+              print(f"?? GILL semantic prompt failed, fallback to original: {e}")
+              result["semantic_prompt"] = current_prompt
+          else:
+            result["semantic_prompt"] = current_prompt
+
+          try:
+            generated_image = self.sd_pipe(
+              prompt=current_prompt,
+              guidance_scale=guidance_scale,
+              num_inference_steps=num_inference_steps,
+              generator=generator
+            ).images[0]
+          except Exception as e:
+            print(f"?? SD direct generation failed: {e}")
         
         result["image"] = generated_image
         
         if enable_feedback and feedback_verifier is not None and generated_image is not None:
-          expected_layout = {"objects": objects} if objects else None
+          expected_layout = objects if objects else None
           feedback = feedback_verifier.verify(generated_image, prompt, expected_layout)
           result["feedback"] = feedback
           
@@ -1337,202 +1167,3 @@ class GILL(nn.Module):
     if result["status"] is None:
       result["status"] = "failed"
     return result
-
-
-def load_gill(model_dir: str, load_ret_embs: bool = True, decision_model_fn: str = 'decision_model.pth.tar', load_sd: bool = True, device_map: Optional[str] = None) -> GILL:
-  model_args_path = os.path.join(model_dir, 'model_args.json')
-  model_ckpt_path = os.path.join(model_dir, 'pretrained_ckpt.pth.tar')
-  embs_paths = [s for s in glob.glob(os.path.join(model_dir, 'cc3m*.npy'))]
-
-  if not os.path.exists(model_args_path):
-    raise ValueError(f'model_args.json does not exist in {model_dir}.')
-  if not os.path.exists(model_ckpt_path):
-    raise ValueError(f'pretrained_ckpt.pth.tar does not exist in {model_dir}.')
-  if not load_ret_embs or len(embs_paths) == 0:
-    if len(embs_paths) == 0:
-      print(f'cc3m.npy files do not exist in {model_dir}.')
-    print('Running the model without retrieval.')
-    path_array, emb_matrix = None, None
-  else:
-    # Load embeddings.
-    # Construct embedding matrix for nearest neighbor lookup.
-    path_array = []
-    emb_matrix = []
-
-    # These were precomputed for all CC3M images with `model.get_visual_embs(image, mode='retrieval')`.
-    for p in embs_paths:
-      with open(p, 'rb') as wf:
-          train_embs_data = pkl.load(wf)
-          path_array.extend(train_embs_data['paths'])
-          emb_matrix.extend(train_embs_data['embeddings'])
-    emb_matrix = np.stack(emb_matrix, axis=0)
-
-    # Number of paths should be equal to number of embeddings.
-    assert len(path_array) == emb_matrix.shape[0], (len(path_array), emb_matrix.shape)
-
-  with open(model_args_path, 'r') as f:
-    model_kwargs = json.load(f)
-
-  # 修复 opt_version 路径（如果路径不存在，尝试自动检测），默认使用 Qwen2.5-7B-Instruct
-  opt_version = model_kwargs.get('opt_version', 'Qwen/Qwen2.5-7B-Instruct')
-  
-  if opt_version.startswith('./') or opt_version.startswith('../'):
-    # 相对路径，检查是否存在（需要转换为绝对路径）
-    abs_opt_version = os.path.abspath(opt_version) if not os.path.isabs(opt_version) else opt_version
-    
-    if not os.path.exists(abs_opt_version):
-      # 尝试常见的替代路径
-      base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目根目录
-      alternative_paths = [
-        os.path.join(base_dir, 'model', 'Qwen2.5-7B-Instruct'),
-        os.path.join(base_dir, 'model', 'qwen2.5-7b-instruct'),
-        os.path.join(base_dir, 'model', 'Qwen', 'Qwen2.5-7B-Instruct'),
-        './model/Qwen2.5-7B-Instruct',
-        './model/qwen2.5-7b-instruct',
-        './model/Qwen/Qwen2.5-7B-Instruct',
-        'model/Qwen2.5-7B-Instruct',
-        'model/qwen2.5-7b-instruct',
-        'model/Qwen/Qwen2.5-7B-Instruct'
-      ]
-      found = False
-      
-      for alt_path in alternative_paths:
-        abs_alt_path = os.path.abspath(alt_path) if not os.path.isabs(alt_path) else alt_path
-        if os.path.exists(abs_alt_path):
-          print(f"⚠️  原始路径不存在: {opt_version}")
-          print(f"   自动切换到: {alt_path}")
-          # 使用绝对路径，确保后续检查正确
-          opt_version = abs_alt_path
-          model_kwargs['opt_version'] = opt_version
-          found = True
-          break
-      if not found:
-        print(f"⚠️  警告: opt_version 路径不存在: {opt_version}")
-        print(f"   尝试使用 HuggingFace Hub 路径...")
-        # 如果都不存在，默认使用官方 Qwen Hub 路径
-        opt_version = 'Qwen/Qwen2.5-7B-Instruct'
-        model_kwargs['opt_version'] = opt_version
-        print(f"   使用: {opt_version}")
-
-  # 修复 visual_encoder 路径（如果路径不存在，尝试自动检测）
-  visual_encoder = model_kwargs.get('visual_encoder', 'openai/clip-vit-large-patch14')
-  
-  if visual_encoder.startswith('./') or visual_encoder.startswith('../'):
-    # 相对路径，检查是否存在（需要转换为绝对路径）
-    abs_visual_encoder = os.path.abspath(visual_encoder) if not os.path.isabs(visual_encoder) else visual_encoder
-    
-    if not os.path.exists(abs_visual_encoder):
-      # 尝试常见的替代路径
-      base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目根目录
-      alternative_paths = [
-        os.path.join(base_dir, 'model', 'chinese_clip_ViT-L-14'),
-        os.path.join(base_dir, 'model', 'chinese-clip-vit-large-patch14'),
-        './model/chinese_clip_ViT-L-14',
-        './model/chinese-clip-vit-large-patch14',
-        'model/chinese_clip_ViT-L-14',
-        'model/chinese-clip-vit-large-patch14'
-      ]
-      found = False
-      
-      for alt_path in alternative_paths:
-        abs_alt_path = os.path.abspath(alt_path) if not os.path.isabs(alt_path) else alt_path
-        if os.path.exists(abs_alt_path):
-          print(f"⚠️  原始 visual_encoder 路径不存在: {visual_encoder}")
-          print(f"   自动切换到: {alt_path}")
-          # 使用绝对路径，确保后续检查正确
-          visual_encoder = abs_alt_path
-          model_kwargs['visual_encoder'] = visual_encoder
-          found = True
-          break
-      if not found:
-        print(f"⚠️  警告: visual_encoder 路径不存在: {visual_encoder}")
-        print(f"   尝试使用 HuggingFace Hub 路径...")
-        # 如果都不存在，尝试使用 HuggingFace Hub
-        if 'chinese' in visual_encoder.lower() or 'clip' in visual_encoder.lower():
-          visual_encoder = 'OFA-Sys/chinese-clip-vit-large-patch14'
-        else:
-          visual_encoder = 'openai/clip-vit-large-patch14'  # 默认
-        model_kwargs['visual_encoder'] = visual_encoder
-        print(f"   使用: {visual_encoder}")
-
-  # Initialize tokenizer.
-  # 检查是否是本地路径（相对路径或绝对路径）
-  _is_local = False
-  if opt_version.startswith('./') or opt_version.startswith('../') or os.path.isabs(opt_version):
-    _abs_path = os.path.abspath(opt_version) if not os.path.isabs(opt_version) else opt_version
-    _is_local = os.path.exists(_abs_path) and os.path.isdir(_abs_path)
-  # Hub 路径（如 'deepseek-ai/deepseek-llm-7b-base'）不是本地路径
-  
-  tokenizer = AutoTokenizer.from_pretrained(opt_version, use_fast=False, local_files_only=_is_local, trust_remote_code=True)
-  if tokenizer.pad_token is None:
-      tokenizer.pad_token_id = tokenizer.eos_token_id
-  # Add an image token for loss masking (and visualization) purposes.
-  tokenizer.add_special_tokens({"cls_token": "<|image|>"})  # add special image token to tokenizer
-
-  # Add [IMG] tokens to the vocabulary.
-  model_kwargs['retrieval_token_idx'] = []
-  for i in range(model_kwargs['num_tokens']):
-      print(f'Adding [IMG{i}] token to vocabulary.')
-      print(f'Before adding new token, tokenizer("[IMG{i}]") =', tokenizer(f'[IMG{i}]', add_special_tokens=False))
-      num_added_tokens = tokenizer.add_tokens(f'[IMG{i}]')
-      print(f'After adding {num_added_tokens} new tokens, tokenizer("[IMG{i}]") =', tokenizer(f'[IMG{i}]', add_special_tokens=False))
-      ret_token_idx = tokenizer(f'[IMG{i}]', add_special_tokens=False).input_ids
-      assert len(ret_token_idx) == 1, ret_token_idx
-      model_kwargs['retrieval_token_idx'].append(ret_token_idx[0])
-  # Use the same RET tokens for generation.
-  model_kwargs['gen_token_idx'] = model_kwargs['retrieval_token_idx']
-
-  args = namedtuple('args', model_kwargs)(**model_kwargs)
-
-  # Load decision model.
-  if decision_model_fn is not None:
-    decision_model_path = os.path.join(model_dir, decision_model_fn)
-  else:
-    decision_model_path = None
-
-  # Initialize model for inference.
-  model = GILL(tokenizer, args, path_array=path_array, emb_matrix=emb_matrix,
-               load_sd=load_sd, num_gen_images=1, decision_model_path=decision_model_path, device_map=device_map)
-  model = model.eval()
-  
-  # Load pretrained linear mappings and [IMG] embeddings (在移到GPU之前加载)
-  print("📦 加载 checkpoint 到 CPU...")
-  checkpoint = torch.load(model_ckpt_path, map_location='cpu')
-  state_dict = {}
-  # This is needed if we train with DDP.
-  for k, v in checkpoint['state_dict'].items():
-      state_dict[k.replace('module.', '')] = v
-  img_token_embeddings = state_dict['model.input_embeddings.weight'].cpu().detach()
-  del state_dict['model.input_embeddings.weight']
-
-  print("📥 加载模型权重...")
-  model.load_state_dict(state_dict, strict=False)
-  
-  # 处理多GPU情况：如果使用device_map="auto"，模型已经在多GPU上了
-  if device_map is not None and isinstance(device_map, str) and device_map.startswith("cuda") and "," in device_map:
-    # 多GPU模式，模型已经通过device_map分布到多GPU
-    print("🚀 模型已通过 device_map 分布到多GPU")
-    model = model.bfloat16()
-  else:
-    # 单GPU模式，正常移到GPU
-    print("🚀 将模型移到 GPU...")
-    model = model.bfloat16()
-    model = model.cuda()
-  
-  # Copy over the embeddings of the [IMG] tokens (while loading the others from the pretrained LLM).
-  print("🎨 设置 IMG token embeddings...")
-  with torch.no_grad():
-      if 'share_ret_gen' in model_kwargs:
-        assert model_kwargs['share_ret_gen'], 'Model loading only supports share_ret_gen=True for now.'
-      # img_token_embeddings包含所有token embeddings，只取最后num_tokens个
-      img_tokens_to_copy = img_token_embeddings[-model_kwargs['num_tokens']:, :].to(model.model.input_embeddings.weight.device)
-      model.model.input_embeddings.weight[-model_kwargs['num_tokens']:, :].copy_(img_tokens_to_copy)
-
-  if load_ret_embs and len(embs_paths) > 0:
-    logit_scale = model.model.logit_scale.exp()
-    emb_matrix = torch.tensor(emb_matrix, dtype=logit_scale.dtype).to(logit_scale.device)
-    emb_matrix = emb_matrix / emb_matrix.norm(dim=1, keepdim=True)
-    emb_matrix = logit_scale * emb_matrix
-    model.emb_matrix = emb_matrix
-
-  return model

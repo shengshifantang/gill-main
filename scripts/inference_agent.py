@@ -26,7 +26,7 @@ from pathlib import Path
 from gill.models import GILL, GILLArgs
 from gill.layout_planner import LayoutPlanner, create_layout_planner_from_gill
 from gill.feedback_verifier import FeedbackVerifier, create_feedback_verifier
-from gill.spatial_adapter import create_spatial_adapter_for_kolors
+from gill.spatial_adapter import create_spatial_adapter_for_kolors, load_spatial_adapter_state_dict
 
 
 class InferenceAgent:
@@ -100,11 +100,35 @@ class InferenceAgent:
         print("📦 加载 Layout Planner...")
         if model_path and os.path.exists(model_path):
             try:
-                # 从检查点加载
-                checkpoint = torch.load(model_path, map_location=self.device)
-                # 这里需要根据实际保存格式调整
-                # self.layout_planner = LayoutPlanner.from_checkpoint(checkpoint)
-                print("  ✅ Layout Planner 加载完成")
+                adapter_config = os.path.join(model_path, "adapter_config.json")
+                if os.path.isdir(model_path) and os.path.exists(adapter_config):
+                    # LoRA/PEFT 适配器
+                    try:
+                        from peft import PeftConfig, PeftModel
+                        peft_config = PeftConfig.from_pretrained(model_path)
+                        base_model_path = peft_config.base_model_name_or_path
+                        self.layout_planner = LayoutPlanner(
+                            base_model_path,
+                            device=self.device,
+                            use_lora=False
+                        )
+                        self.layout_planner.model = PeftModel.from_pretrained(
+                            self.layout_planner.model,
+                            model_path
+                        )
+                        self.layout_planner.model.eval()
+                        print("  ✅ Layout Planner (LoRA) 加载完成")
+                    except Exception as e:
+                        print(f"  ⚠️ LoRA 适配器加载失败: {e}")
+                        self.layout_planner = None
+                else:
+                    # 完整模型目录或单一模型路径
+                    self.layout_planner = LayoutPlanner(
+                        model_path,
+                        device=self.device,
+                        use_lora=False
+                    )
+                    print("  ✅ Layout Planner 加载完成")
             except Exception as e:
                 print(f"  ⚠️ Layout Planner 加载失败: {e}")
                 self.layout_planner = None
@@ -117,19 +141,23 @@ class InferenceAgent:
     def _load_spatial_adapter(self, model_path: Optional[str]):
         """加载 Spatial Adapter"""
         print("📦 加载 Spatial Adapter...")
+        self.spatial_adapter = create_spatial_adapter_for_kolors()
         if model_path and os.path.exists(model_path):
             try:
                 checkpoint = torch.load(model_path, map_location=self.device)
-                self.spatial_adapter = create_spatial_adapter_for_kolors()
-                # 加载权重
-                # self.spatial_adapter.load_state_dict(checkpoint['state_dict'])
-                print("  ✅ Spatial Adapter 加载完成")
+                state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+                if isinstance(state_dict, dict) and any(k.startswith("module.") for k in state_dict.keys()):
+                    state_dict = {k[7:]: v for k, v in state_dict.items()}
+                self.spatial_adapter = load_spatial_adapter_state_dict(
+                    state_dict,
+                    device=self.device,
+                    dtype=torch.float32
+                )
+                print(f"  ✅ Spatial Adapter 权重已载入 (模块数: {len(self.spatial_adapter)})")
             except Exception as e:
                 print(f"  ⚠️ Spatial Adapter 加载失败: {e}")
-                self.spatial_adapter = None
         else:
             print("  ⚠️ 未提供 Spatial Adapter 路径，将使用默认版本")
-            self.spatial_adapter = create_spatial_adapter_for_kolors()
     
     def _load_verifier(self, model_path: str, verifier_type: str = "hybrid"):
         """
@@ -519,4 +547,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

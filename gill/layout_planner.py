@@ -11,6 +11,28 @@ from typing import List, Dict, Optional
 import re
 import json
 
+FORMAT_INSTRUCTION = (
+    "请严格按照以下格式输出：<obj>名称</obj><box>[x1,y1,x2,y2]</box>... "
+    "坐标范围为0-1000，且必须覆盖提示中的所有实体，不要遗漏。"
+    "如果无法给出布局，请输出 <no_layout>。只输出格式，不要解释。"
+)
+
+STRICT_ENTITY_INSTRUCTION = (
+    "【覆盖强约束】请先在心里列出提示中的所有实体（不要输出清单），"
+    "输出必须逐一覆盖这些实体，数量必须一致；"
+    "禁止合并/泛化/省略，禁止用“物体/东西/景物”等替代。"
+)
+
+
+def _append_format_instruction(text: str, strict_entities: bool = False) -> str:
+    if "<obj>" in text or "只输出格式" in text:
+        base = text
+    else:
+        base = f"{text}\n\n{FORMAT_INSTRUCTION}"
+    if strict_entities and "覆盖强约束" not in base:
+        return f"{base}\n{STRICT_ENTITY_INSTRUCTION}"
+    return base
+
 
 def parse_layout_output(text: str) -> List[Dict]:
     """
@@ -22,31 +44,69 @@ def parse_layout_output(text: str) -> List[Dict]:
     2. 后备格式：从乱码中提取坐标 [x1,y1,x2,y2] 和对象名
     """
     objects = []
-    
-    # 模式1：标准格式解析
-    pattern = r'<obj>([^<]+)</obj><box>\[([^\]]+)\]</box>'
-    matches = re.findall(pattern, text)
-    
+
+    if "<no_layout>" in text:
+        return objects
+
+    def _normalize(text_in: str) -> str:
+        # Normalize common full-width punctuation to improve parsing robustness.
+        text_in = text_in.replace("，", ",").replace("；", ";")
+        text_in = text_in.replace("［", "[").replace("］", "]")
+        return text_in
+
+    def _normalize_bbox_values(vals: List[float]) -> List[float]:
+        max_v = max(vals)
+        # Already normalized (0-1)
+        if max_v <= 1.5:
+            return vals
+        # 0-100 scale
+        if max_v <= 100:
+            return [v / 100.0 for v in vals]
+        # 0-1000 scale (allow mixed with normalized values)
+        if max_v <= 1000:
+            return [v / 1000.0 if v > 1.5 else v for v in vals]
+        # Fallback: very large values, scale down large ones
+        return [v / 1000.0 if v > 1.5 else v for v in vals]
+
+    def _parse_bbox(bbox_str: str) -> Optional[List[float]]:
+        # Extract floats to handle spaces, Chinese comma, or mixed separators.
+        nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", bbox_str)
+        if len(nums) < 4:
+            return None
+        bbox = [float(x) for x in nums[:4]]
+        bbox = _normalize_bbox_values(bbox)
+        # Reorder if necessary and clamp to [0, 1]
+        x1, y1, x2, y2 = bbox
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+        bbox = [max(0.0, min(1.0, v)) for v in (x1, y1, x2, y2)]
+        return bbox
+
+    text = _normalize(text)
+
+    # 模式1：标准格式解析（允许空格/换行）
+    pattern = re.compile(r"<obj>\s*([^<]+?)\s*</obj>\s*<box>\s*\[([^\]]+)\]\s*</box>", re.S)
+    matches = pattern.findall(text)
+
     if matches:  # 如果标准格式解析成功，直接返回
         for name, bbox_str in matches:
             try:
-                bbox = [float(x.strip()) for x in bbox_str.split(',')]
-                if len(bbox) == 4:
-                    # 简单的坐标范围检查/归一化（如果是 0-1000 格式）
-                    if max(bbox) > 1.5:
-                        bbox = [b / 1000.0 for b in bbox]
-                    
-                    objects.append({
-                        "name": name.strip(),
-                        "bbox": bbox
-                    })
-            except:
+                bbox = _parse_bbox(bbox_str)
+                if bbox is None or len(bbox) != 4:
+                    continue
+                objects.append({
+                    "name": name.strip(),
+                    "bbox": bbox
+                })
+            except Exception:
                 continue
         return objects
     
     # 模式2：后备解析（从乱码中提取坐标和对象名）
     # 提取所有坐标格式：[...]
-    bbox_pattern = r'\[([0-9.,\s]+)\]'
+    bbox_pattern = r'\[([^\]]+)\]'
     bbox_matches = re.findall(bbox_pattern, text)
     
     # 提取可能的对象名（中文词汇，长度 1-6）
@@ -60,26 +120,30 @@ def parse_layout_output(text: str) -> List[Dict]:
     
     for i, bbox_str in enumerate(bbox_matches):
         try:
-            bbox = [float(x.strip()) for x in bbox_str.split(',')]
-            if len(bbox) == 4:
-                # 归一化
-                if max(bbox) > 1.5:
-                    bbox = [b / 1000.0 for b in bbox]
-                
-                # 获取对象名（优先使用对应位置的中文词，否则使用"物体"）
-                name = chinese_words[i] if i < len(chinese_words) else "物体"
-                
-                objects.append({
-                    "name": name.strip(),
-                    "bbox": bbox
-                })
-        except:
+            bbox = _parse_bbox(bbox_str)
+            if bbox is None or len(bbox) != 4:
+                continue
+
+            # 获取对象名（优先使用对应位置的中文词，否则使用"物体"）
+            name = chinese_words[i] if i < len(chinese_words) else "物体"
+
+            objects.append({
+                "name": name.strip(),
+                "bbox": bbox
+            })
+        except Exception:
             continue
     
     return objects
 
 
-def format_layout_input(tokenizer, prompt: str, enable_cot: bool = False, feedback: Optional[str] = None) -> str:
+def format_layout_input(
+    tokenizer,
+    prompt: str,
+    enable_cot: bool = False,
+    feedback: Optional[str] = None,
+    strict_entities: bool = False,
+) -> str:
     """
     使用 Tokenizer 的 Chat Template 格式化输入
     """
@@ -94,6 +158,8 @@ def format_layout_input(tokenizer, prompt: str, enable_cot: bool = False, feedba
 3. 最后，输出布局坐标"""
     else:
         user_content = prompt
+
+    user_content = _append_format_instruction(user_content, strict_entities=strict_entities)
 
     messages = [{"role": "user", "content": user_content}]
     
@@ -120,7 +186,7 @@ class LayoutPlanner(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
         
         # 添加布局相关的特殊 token
-        special_tokens = {"additional_special_tokens": ["<obj>", "</obj>", "<box>", "</box>"]}
+        special_tokens = {"additional_special_tokens": ["<obj>", "</obj>", "<box>", "</box>", "<no_layout>"]}
         num_added = self.tokenizer.add_special_tokens(special_tokens)
         if num_added > 0:
             print(f"✓ 添加了 {num_added} 个布局特殊 token")
@@ -167,7 +233,8 @@ class LayoutPlanner(nn.Module):
     def generate_layout(self, prompt: str, max_length: int = 512,
                        temperature: float = 0.2, top_p: float = 0.9,
                        apply_refinement: bool = True, enable_cot: bool = False,
-                       feedback: Optional[str] = None) -> Dict:
+                       feedback: Optional[str] = None,
+                       strict_entities: bool = False) -> Dict:
         """
         生成布局规划
         
@@ -190,7 +257,7 @@ class LayoutPlanner(nn.Module):
         
         # 1. 格式化输入 (使用 Chat Template)
         formatted_input = format_layout_input(
-            self.tokenizer, prompt, enable_cot=enable_cot, feedback=feedback
+            self.tokenizer, prompt, enable_cot=enable_cot, feedback=feedback, strict_entities=strict_entities
         )
         
         # 2. Tokenize

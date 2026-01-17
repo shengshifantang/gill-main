@@ -356,7 +356,7 @@ def train_spatial_adapter(
 
     # 2. Adapter
     adapter_container = create_spatial_adapter_for_kolors()
-    # adapter_container.to(device, dtype=torch.float16)  # ⚠️ 移到 Adapter 创建后
+    adapter_container.to(device, dtype=torch.float32)
 
     # 2.1 预构建 Adapter（避免参数为空导致 optimizer 失败）
     try:
@@ -368,11 +368,9 @@ def train_spatial_adapter(
             bboxes=dummy_bboxes,
             phrase_embeddings=None,
             masks=dummy_masks,
-            adapter_dtype=torch.float16,
+            adapter_dtype=torch.float32,
         )
         remove_spatial_control_from_unet(unet, orig_procs)
-        # ✅ 在 Adapter 创建后再设置 dtype
-        adapter_container.to(device, dtype=torch.float16)
     except Exception as e:
         print(f"⚠️ Adapter warm-up failed: {e}")
 
@@ -487,7 +485,7 @@ def train_spatial_adapter(
                     text_hidden = getattr(text_encoder.config, "hidden_size", 4096)
 
                     # Initialize with Zeros
-                    phrase_emb_batch = torch.zeros((bs * max_boxes, text_hidden), device=device, dtype=torch.float16)
+                    phrase_emb_batch = torch.zeros((bs * max_boxes, text_hidden), device=device, dtype=torch.float32)
 
                     # Flatten
                     flat_names = [name for names in obj_names_batch for name in names]
@@ -535,7 +533,7 @@ def train_spatial_adapter(
                                             emb = emb.mean(dim=0) if emb.shape[0] > 1 else emb.squeeze(0)
                                         elif emb.dim() > 2:
                                             emb = emb.reshape(-1, emb.shape[-1]).mean(dim=0)
-                                        phrase_emb_batch[idx] = emb.to(dtype=torch.float16)
+                                        phrase_emb_batch[idx] = emb.to(dtype=torch.float32)
                                 embs = None
                             else:
                                 # Pooling with mask if safe
@@ -552,7 +550,7 @@ def train_spatial_adapter(
                             if embs is not None:
                                 safe_count = min(embs.shape[0], len(valid_indices))
                                 if safe_count > 0:
-                                    phrase_emb_batch[valid_indices[:safe_count]] = embs[:safe_count].to(dtype=torch.float16)
+                                    phrase_emb_batch[valid_indices[:safe_count]] = embs[:safe_count].to(dtype=torch.float32)
 
                         except Exception as e:
                             phrase_fail += 1
@@ -586,7 +584,7 @@ def train_spatial_adapter(
                 bboxes=bboxes,
                 phrase_embeddings=phrase_embeddings,
                 masks=masks,
-                adapter_dtype=torch.float16,
+                adapter_dtype=torch.float32,
             )
             if hasattr(adapter_container, "set_scale"):
                 if scale_max < scale_min:
